@@ -59,15 +59,16 @@ jobs:
           restore-keys: |
             deriveddata-${{ runner.os }}-
 
-      - name: Decode signing certificate
+      - name: Decode and validate signing certificate
         run: |
-          echo "$IOS_CERTIFICATE_P12_BASE64" | base64 --decode > $RUNNER_TEMP/cove_cert.p12
+          printf '%s' "$IOS_CERTIFICATE_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cove_cert.p12"
+          openssl pkcs12 -in "$RUNNER_TEMP/cove_cert.p12" -nokeys -passin pass:"$CERT_PASSWORD" >/dev/null
         env:
           IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
 
       - name: Decode provisioning profile
         run: |
-          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > $RUNNER_TEMP/cove.mobileprovision
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 -d > "$RUNNER_TEMP/cove.mobileprovision"
         env:
           IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
 
