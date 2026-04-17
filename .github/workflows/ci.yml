@@ -61,14 +61,28 @@ jobs:
 
       - name: Decode and validate signing certificate
         run: |
-          printf '%s' "$IOS_CERTIFICATE_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cove_cert.p12"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          data = os.environ.get("IOS_CERTIFICATE_P12_BASE64", "").strip()
+          if not data:
+              raise SystemExit("IOS_CERTIFICATE_P12_BASE64 is empty")
+          raw = base64.b64decode("".join(data.split()), validate=False)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "cove_cert.p12").write_bytes(raw)
+          PY
           openssl pkcs12 -in "$RUNNER_TEMP/cove_cert.p12" -nokeys -passin pass:"$CERT_PASSWORD" >/dev/null
         env:
           IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
 
       - name: Decode provisioning profile
         run: |
-          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 -d > "$RUNNER_TEMP/cove.mobileprovision"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          data = os.environ.get("IOS_PROVISIONING_PROFILE_BASE64", "").strip()
+          if not data:
+              raise SystemExit("IOS_PROVISIONING_PROFILE_BASE64 is empty")
+          raw = base64.b64decode("".join(data.split()), validate=False)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "cove.mobileprovision").write_bytes(raw)
+          PY
         env:
           IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
 
