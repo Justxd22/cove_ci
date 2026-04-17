@@ -1,0 +1,538 @@
+use std::sync::Arc;
+
+use bdk_wallet::Wallet as BdkWallet;
+use bdk_wallet::bitcoin::Transaction as BdkTransaction;
+use bdk_wallet::chain::{
+    ChainPosition as BdkChainPosition, ConfirmationBlockTime, tx_graph::CanonicalTx,
+};
+use bip329::{Label, Labels, TransactionRecord};
+use bitcoin::params::Params;
+use cove_types::Network;
+use jiff::Timestamp;
+use numfmt::{Formatter, Precision};
+
+use crate::{
+    database::Database,
+    fiat::{FiatCurrency, client::FIAT_CLIENT, historical::HistoricalPrice},
+    historical_price_service::HistoricalPriceService,
+    transaction::{TransactionDirection, Unit},
+};
+use cove_tokio::task;
+
+use crate::{
+    device::Device,
+    wallet::{Address, address},
+};
+use cove_util::{format::NumberFormatter as _, result_ext::ResultExt as _};
+use tap::TapFallible;
+
+use super::{Amount, FeeRate, SentAndReceived, TxId};
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+#[uniffi::export(Display)]
+pub enum TransactionDetailError {
+    #[error("Unable to determine fee: {0}")]
+    Fee(String),
+
+    #[error("Unable to determine fee rate: {0}")]
+    FeeRate(String),
+
+    #[error("Unable to determine address: {0}")]
+    Address(#[from] address::AddressError),
+
+    #[error("Unable to get fiat amount: {0}")]
+    FiatAmount(String),
+
+    #[error("Unable to get change address: {0}")]
+    ChangeAddress(String),
+
+    #[error("Unsupported network: {0}")]
+    UnsupportedNetwork(String),
+
+    #[error("Transaction not found")]
+    NotFound,
+}
+
+type Error = TransactionDetailError;
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Object)]
+pub struct TransactionDetails {
+    pub tx_id: TxId,
+    pub address: Option<Address>,
+    pub sent_and_received: SentAndReceived,
+    pub fee: Option<Amount>,
+    pub fee_rate: Option<FeeRate>,
+    pub pending_or_confirmed: PendingOrConfirmed,
+    pub labels: Labels,
+    pub input_indexes: Vec<u32>,
+    pub output_indexes: Vec<u32>,
+    pub network: Network,
+    // for outgoing transactions we might have a change address
+    pub change_address: Option<Address>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum PendingOrConfirmed {
+    Pending(PendingDetails),
+    Confirmed(ConfirmedDetails),
+}
+
+impl TransactionDetails {
+    pub fn try_new(
+        wallet: &BdkWallet,
+        tx: CanonicalTx<Arc<BdkTransaction>, ConfirmationBlockTime>,
+        labels: Labels,
+    ) -> Result<Self, Error> {
+        let txid = tx.tx_node.txid;
+        let sent_and_received: SentAndReceived = wallet.sent_and_received(&tx.tx_node.tx).into();
+        let chain_postition = &tx.chain_position;
+        let tx_details = wallet.get_tx(txid).ok_or(Error::NotFound)?.tx_node.tx;
+        let network = Network::try_from(wallet.network()).map_err(Error::UnsupportedNetwork)?;
+
+        let fee = wallet
+            .calculate_fee(&tx_details)
+            .tap_err(|e| tracing::debug!("Failed to calculate fee for {txid}: {e}"))
+            .ok()
+            .map(Into::into);
+        let fee_rate = wallet
+            .calculate_fee_rate(&tx_details)
+            .tap_err(|e| tracing::debug!("Failed to calculate fee rate for {txid}: {e}"))
+            .ok()
+            .map(Into::into);
+
+        let address = Address::try_new(&tx, wallet)
+            .tap_err(|e| tracing::debug!("Failed to get address for {txid}: {e}"))
+            .ok();
+        let pending_or_confirmed = PendingOrConfirmed::new(chain_postition);
+
+        let change_address = match sent_and_received.direction {
+            TransactionDirection::Incoming => None,
+            TransactionDirection::Outgoing => {
+                let outputs = tx.tx_node.tx.output.iter();
+                let script = outputs.map(|o| o.script_pubkey.clone()).find_map(|pubkey| {
+                    if wallet.is_mine(pubkey.clone()) {
+                        Some(pubkey.into_boxed_script())
+                    } else {
+                        None
+                    }
+                });
+
+                match script {
+                    Some(script) => {
+                        let network = wallet.network();
+                        let address = bitcoin::Address::from_script(&script, Params::from(network))
+                            .map_err_str(Error::ChangeAddress)?;
+
+                        Some(address)
+                    }
+                    None => None,
+                }
+            }
+        }
+        .map(Address::new);
+
+        let input_indexes = tx
+            .tx_node
+            .tx
+            .input
+            .iter()
+            .filter(|input| wallet.is_mine(input.script_sig.clone()))
+            .map(|input| input.previous_output.vout)
+            .collect();
+
+        let output_indexes = tx
+            .tx_node
+            .tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_index, output)| wallet.is_mine(output.script_pubkey.clone()))
+            .map(|(index, _output)| index as u32)
+            .collect();
+
+        let me = Self {
+            tx_id: txid.into(),
+            network,
+            address,
+            sent_and_received,
+            fee,
+            pending_or_confirmed,
+            fee_rate,
+            labels,
+            input_indexes,
+            output_indexes,
+            change_address,
+        };
+
+        Ok(me)
+    }
+
+    pub fn sent_sans_fee(&self) -> Option<Amount> {
+        if self.is_received() {
+            return None;
+        }
+
+        let fee: Amount = self.fee?;
+        let sent: Amount = self.amount();
+
+        let sans_fee = sent.checked_sub(fee.0)?;
+
+        Some(sans_fee.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct PendingDetails {
+    last_seen: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct ConfirmedDetails {
+    block_number: u32,
+    confirmation_time: u64,
+}
+
+impl PendingOrConfirmed {
+    pub fn new(chain_position: &BdkChainPosition<ConfirmationBlockTime>) -> Self {
+        match chain_position {
+            BdkChainPosition::Unconfirmed { last_seen, .. } => {
+                Self::Pending(PendingDetails { last_seen: (*last_seen).unwrap_or_default() })
+            }
+            BdkChainPosition::Confirmed { anchor: confirmation_blocktime, .. } => {
+                Self::Confirmed(ConfirmedDetails {
+                    block_number: confirmation_blocktime.block_id.height,
+                    confirmation_time: confirmation_blocktime.confirmation_time,
+                })
+            }
+        }
+    }
+
+    const fn is_confirmed(&self) -> bool {
+        matches!(self, Self::Confirmed(_))
+    }
+}
+
+#[uniffi::export]
+impl TransactionDetails {
+    #[uniffi::method]
+    pub const fn tx_id(&self) -> TxId {
+        self.tx_id
+    }
+
+    #[uniffi::method]
+    pub fn address(&self) -> Option<Arc<Address>> {
+        self.address.clone().map(Arc::new)
+    }
+
+    #[uniffi::method]
+    pub fn amount(&self) -> Amount {
+        self.sent_and_received.amount()
+    }
+
+    #[uniffi::method]
+    pub async fn amount_fiat(&self) -> Result<f64, Error> {
+        let amount = self.amount();
+
+        task::spawn(async move {
+            FIAT_CLIENT
+                .current_value_in_currency(amount, currency())
+                .await
+                .map_err_str(Error::FiatAmount)
+        })
+        .await
+        .map_err_prefix("task failed", Error::FiatAmount)?
+    }
+
+    #[uniffi::method]
+    pub async fn amount_fiat_fmt(&self) -> Result<String, Error> {
+        let amount = self.amount_fiat().await?;
+        Ok(fiat_amount_fmt(amount))
+    }
+
+    #[uniffi::method]
+    pub fn amount_fiat_fmt_cached(&self) -> Option<String> {
+        let amount = self.amount();
+        let fiat = FIAT_CLIENT.value_in_currency_cached(amount, currency())?;
+        Some(fiat_amount_fmt(fiat))
+    }
+
+    #[uniffi::method]
+    pub fn fee_fmt(&self, unit: Unit) -> Option<String> {
+        let fee = self.fee?;
+        Some(fee.fmt_string_with_unit(unit))
+    }
+
+    #[uniffi::method]
+    pub async fn fee_fiat_fmt(&self) -> Result<String, Error> {
+        let fee = self.fee.ok_or_else(|| Error::Fee("No fee".to_string()))?;
+        let fiat = task::spawn(async move {
+            FIAT_CLIENT
+                .current_value_in_currency(fee, currency())
+                .await
+                .map_err_str(Error::FiatAmount)
+        })
+        .await
+        .map_err_prefix("task failed", Error::FiatAmount)??;
+
+        Ok(fiat_amount_fmt(fiat))
+    }
+
+    #[uniffi::method]
+    pub fn fee_fiat_fmt_cached(&self) -> Option<String> {
+        let fee = self.fee?;
+        let fiat = FIAT_CLIENT.value_in_currency_cached(fee, currency())?;
+        Some(fiat_amount_fmt(fiat))
+    }
+
+    #[uniffi::method]
+    pub fn amount_fmt(&self, unit: Unit) -> String {
+        self.sent_and_received.amount_fmt(unit)
+    }
+
+    #[uniffi::method]
+    pub fn is_received(&self) -> bool {
+        self.sent_and_received.direction() == TransactionDirection::Incoming
+    }
+
+    #[uniffi::method]
+    pub fn is_sent(&self) -> bool {
+        !self.is_received()
+    }
+
+    #[uniffi::method]
+    pub fn sent_sans_fee_fmt(&self, unit: Unit) -> Option<String> {
+        let amount = self.sent_sans_fee()?;
+        Some(amount.fmt_string_with_unit(unit))
+    }
+
+    #[uniffi::method]
+    pub async fn sent_sans_fee_fiat_fmt(&self) -> Result<String, Error> {
+        let amount = self.sent_sans_fee().ok_or_else(|| Error::Fee("No fee".to_string()))?;
+
+        let fiat = task::spawn(async move {
+            FIAT_CLIENT
+                .current_value_in_currency(amount, currency())
+                .await
+                .map_err_str(Error::FiatAmount)
+        })
+        .await
+        .map_err_prefix("task failed", Error::FiatAmount)??;
+
+        Ok(fiat_amount_fmt(fiat))
+    }
+
+    #[uniffi::method]
+    pub fn sent_sans_fee_fiat_fmt_cached(&self) -> Option<String> {
+        let amount = self.sent_sans_fee()?;
+        let fiat = FIAT_CLIENT.value_in_currency_cached(amount, currency())?;
+        Some(fiat_amount_fmt(fiat))
+    }
+
+    #[uniffi::method]
+    pub fn is_confirmed(&self) -> bool {
+        self.pending_or_confirmed.is_confirmed()
+    }
+
+    #[uniffi::method]
+    pub fn confirmation_date_time(&self) -> Option<String> {
+        let confirm_time = match &self.pending_or_confirmed {
+            PendingOrConfirmed::Pending(_) => None,
+            PendingOrConfirmed::Confirmed(confirmed) => Some(confirmed.confirmation_time),
+        }? as i64;
+
+        // get timezone
+        let timezone_string = Device::global().timezone();
+
+        // create a Timestamp from Unix seconds
+        let ts = Timestamp::from_second(confirm_time).ok()?;
+
+        // Convert to local time zone
+        let local = match ts.in_tz(&timezone_string) {
+            Ok(local) => local,
+            Err(error) => {
+                tracing::warn!("unable to convert timestamp: {error}");
+                ts.in_tz("UTC").ok()?
+            }
+        };
+
+        // Format the timestamp
+        jiff::fmt::strtime::format("%B %e, %Y at %-I:%M %p", &local).ok()
+    }
+
+    #[uniffi::method]
+    pub fn transaction_url(&self) -> String {
+        match self.network {
+            Network::Bitcoin => format!("https://mempool.space/tx/{}", self.tx_id.0),
+            Network::Testnet => format!("https://mempool.space/testnet/tx/{}", self.tx_id.0),
+            Network::Testnet4 => format!("https://mempool.space/testnet4/tx/{}", self.tx_id.0),
+            Network::Signet => format!("https://mutinynet.com/tx/{}", self.tx_id.0),
+        }
+    }
+
+    #[uniffi::method]
+    pub fn transaction_label(&self) -> Option<String> {
+        let label = self.labels.transaction_label()?;
+        if label.is_empty() {
+            return None;
+        }
+
+        Some(label.to_string())
+    }
+
+    #[uniffi::method]
+    pub const fn block_number(&self) -> Option<u32> {
+        match &self.pending_or_confirmed {
+            PendingOrConfirmed::Pending(_) => None,
+            PendingOrConfirmed::Confirmed(confirmed) => Some(confirmed.block_number),
+        }
+    }
+
+    #[uniffi::method]
+    pub fn block_number_fmt(&self) -> Option<String> {
+        let block_number = self.block_number()?;
+        let mut f = Formatter::new().separator(',').unwrap().precision(Precision::Decimals(0));
+        Some(f.fmt(block_number).to_string())
+    }
+    #[uniffi::method]
+    pub fn address_spaced_out(&self) -> Option<String> {
+        self.address.as_ref().map(cove_types::address::Address::spaced_out)
+    }
+
+    /// Historical fiat value at time of transaction - cached version (no network calls)
+    #[uniffi::method]
+    pub fn historical_fiat_fmt_cached(&self) -> Option<String> {
+        let block_number = self.block_number()?;
+        let db = Database::global().historical_prices();
+        let price_record = db.get_price_for_block(self.network, block_number).ok()??;
+        let price = HistoricalPrice::from(price_record);
+        let currency_price = price.for_currency(currency())?;
+
+        let fiat_value = self.amount().as_btc() * currency_price as f64;
+        Some(fmt_historical_fiat(fiat_value))
+    }
+
+    /// Historical fiat value at time of transaction - async version (fetches from API if not cached)
+    #[uniffi::method]
+    pub async fn historical_fiat_fmt(&self) -> Result<String, Error> {
+        let block_number = self.block_number().ok_or_else(|| {
+            Error::FiatAmount("pending transaction has no historical price".into())
+        })?;
+
+        let confirmed_at = match &self.pending_or_confirmed {
+            PendingOrConfirmed::Confirmed(c) => c.confirmation_time,
+            PendingOrConfirmed::Pending(_) => {
+                return Err(Error::FiatAmount("pending".into()));
+            }
+        };
+
+        let network = self.network;
+        let amount_btc = self.amount().as_btc();
+        let currency = currency();
+
+        let currency_price = task::spawn(async move {
+            let service = HistoricalPriceService::new();
+            service.get_price_for_block(network, block_number, confirmed_at, currency).await
+        })
+        .await
+        .map_err_prefix("task failed", Error::FiatAmount)?
+        .map_err_str(Error::FiatAmount)?
+        .ok_or_else(|| Error::FiatAmount("no price for currency".into()))?;
+
+        let fiat_value = amount_btc * currency_price as f64;
+        Ok(fmt_historical_fiat(fiat_value))
+    }
+}
+
+#[uniffi::export]
+impl TransactionDetails {
+    #[uniffi::constructor]
+    pub fn preview_new_confirmed() -> Self {
+        Self {
+            tx_id: TxId::preview_new(),
+            address: Some(Address::preview_new()),
+            sent_and_received: SentAndReceived::preview_new(),
+            fee: Some(Amount::from_sat(880_303)),
+            fee_rate: Some(FeeRate::preview_new()),
+            pending_or_confirmed: PendingOrConfirmed::Confirmed(ConfirmedDetails {
+                block_number: 840_000,
+                confirmation_time: 1_677_721_600,
+            }),
+            network: Network::Bitcoin,
+            labels: Default::default(),
+            input_indexes: vec![],
+            output_indexes: vec![],
+            change_address: None,
+        }
+    }
+
+    #[uniffi::constructor]
+    pub fn preview_confirmed_received() -> Self {
+        let mut me = Self::preview_new_confirmed();
+        me.sent_and_received = SentAndReceived::preview_incoming();
+        me
+    }
+
+    #[uniffi::constructor]
+    pub fn preview_confirmed_sent() -> Self {
+        let mut me = Self::preview_new_confirmed();
+        me.sent_and_received = SentAndReceived::preview_outgoing();
+        me
+    }
+
+    #[uniffi::constructor]
+    pub fn preview_pending_received() -> Self {
+        let mut me = Self::preview_new_confirmed();
+        me.sent_and_received = SentAndReceived::preview_incoming();
+        me.pending_or_confirmed =
+            PendingOrConfirmed::Pending(PendingDetails { last_seen: 1_677_721_600 });
+
+        me
+    }
+
+    #[uniffi::constructor]
+    pub fn preview_pending_sent() -> Self {
+        let mut me = Self::preview_new_confirmed();
+        me.sent_and_received = SentAndReceived::preview_outgoing();
+        me.pending_or_confirmed =
+            PendingOrConfirmed::Pending(PendingDetails { last_seen: 1_677_721_600 });
+
+        me
+    }
+
+    #[uniffi::constructor(default(label = "bike payment"))]
+    pub fn preview_new_with_label(label: String) -> Self {
+        let mut me = Self::preview_new_confirmed();
+        me.labels = vec![Label::from(TransactionRecord {
+            ref_: *TxId::preview_new(),
+            label: Some(label),
+            origin: None,
+        })]
+        .into();
+
+        me
+    }
+}
+
+/// MARK: local helpers
+fn currency() -> FiatCurrency {
+    Database::global().global_config.fiat_currency().unwrap_or_default()
+}
+
+fn fiat_amount_fmt(amount: f64) -> String {
+    let amount_fmt = amount.thousands_fiat();
+
+    let currency = currency();
+    let symbol = currency.symbol();
+    let suffix = currency.suffix();
+
+    format!("≈ {symbol}{amount_fmt} {suffix}")
+}
+
+fn fmt_historical_fiat(amount: f64) -> String {
+    let amount_fmt = amount.thousands_fiat();
+
+    let currency = currency();
+    let symbol = currency.symbol();
+    let suffix = currency.suffix();
+
+    format!("{symbol}{amount_fmt} {suffix}")
+}

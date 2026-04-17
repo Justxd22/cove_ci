@@ -1,0 +1,345 @@
+import MijickPopups
+import Observation
+import SwiftUI
+
+private let walletModeChangeDelayMs = 250
+
+enum CloudBackupRootPromptBlocker: Hashable {
+    case settingsLocalModal
+    case settingsCloudBackupDialog
+    case cloudBackupDetailBusy
+    case cloudBackupDetailDialog
+}
+
+@Observable final class AppManager: FfiReconcile {
+    static let shared = makeShared()
+
+    private let logger = Log(id: "AppManager")
+
+    var rust: FfiApp
+    var router: Router
+    var database: Database
+    var wallets: [WalletMetadata] = []
+    var isSidebarVisible = false
+    var asyncRuntimeReady = false
+
+    var alertState: TaggedItem<AppAlertState>? = .none
+    var sheetState: TaggedItem<AppSheetState>? = .none
+    var cloudBackupRootPromptBlockers: Set<CloudBackupRootPromptBlocker> = []
+
+    /// tracks if current screen is scrolled past header for adaptive nav styling
+    var isPastHeader = false
+
+    var isTermsAccepted: Bool = Database().globalFlag().isTermsAccepted()
+    var selectedNetwork = Database().globalConfig().selectedNetwork()
+
+    var colorSchemeSelection = Database().globalConfig().colorScheme()
+    var selectedNode = Database().globalConfig().selectedNode()
+    var selectedFiatCurrency = Database().globalConfig().selectedFiatCurrency()
+
+    var nfcReader = NFCReader()
+    var nfcWriter = NFCWriter()
+    var tapSignerNfc: TapSignerNFC?
+
+    var prices: PriceResponse?
+    var fees: FeeResponse?
+
+    @MainActor
+    var isLoading = false
+
+    /// changed when route is reset, to clear lifecycle view state
+    var routeId = UUID()
+
+    /// Multiple screens within the same wallet (send, coin control, tx details, settings)
+    /// call getWalletManager, this avoids recreating the actor and reconciler each time
+    @ObservationIgnored
+    var walletManager: WalletManager?
+
+    @ObservationIgnored
+    var sendFlowManager: SendFlowManager?
+
+    var isCloudBackupRootPromptBlocked: Bool {
+        !cloudBackupRootPromptBlockers.isEmpty
+    }
+
+    public var colorScheme: ColorScheme? {
+        switch colorSchemeSelection {
+        case .light:
+            .light
+        case .dark:
+            .dark
+        case .system:
+            nil
+        }
+    }
+
+    private static func makeShared() -> AppManager {
+        requireBootstrapComplete()
+        return AppManager()
+    }
+
+    private static func requireBootstrapComplete() {
+        if ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1" { return }
+
+        let step = bootstrapProgress()
+        guard step == .complete else {
+            fatalError("AppManager initialized before bootstrap completed: \(step)")
+        }
+    }
+
+    private init() {
+        logger.debug("Initializing AppManager")
+
+        let rust = FfiApp()
+        let state = rust.state()
+
+        router = state.router
+        self.rust = rust
+        database = Database()
+        wallets = (try? database.wallets().all()) ?? []
+
+        // set the cached prices and fees
+        prices = try? rust.prices()
+        fees = try? rust.fees()
+
+        self.rust.listenForUpdates(updater: self)
+    }
+
+    public func getWalletManager(id: WalletId) throws -> WalletManager {
+        if let walletvm = walletManager, walletvm.id == id {
+            logger.debug("found and using vm for \(id)")
+            return walletvm
+        }
+
+        logger.debug("did not find vm for \(id), creating new vm: \(walletManager?.id ?? "none")")
+
+        let walletvm = try WalletManager(id: id)
+        walletManager = walletvm
+
+        return walletManager!
+    }
+
+    public func getSendFlowManager(_ wm: WalletManager, presenter: SendFlowPresenter) -> SendFlowManager {
+        let id = wm.id
+
+        if let manager = sendFlowManager, wm.id == manager.id {
+            logger.debug("found and using sendflow manager for \(wm.id)")
+            manager.presenter = presenter
+            return manager
+        }
+
+        let sendFlowManager = SendFlowManager(wm.rust.newSendFlowManager(balance: wm.balance), presenter: presenter)
+        logger.debug("did not find SendFlowManager for \(id), creating new")
+
+        self.sendFlowManager = sendFlowManager
+        return sendFlowManager
+    }
+
+    public var fullVersionId: String {
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        return "v\(appVersion) (\(rust.gitShortHash())-\(buildNumber))"
+    }
+
+    public func updateWalletVm(_ vm: WalletManager) {
+        walletManager = vm
+    }
+
+    public func findTapSignerWallet(_ ts: TapSigner) -> WalletMetadata? {
+        rust.findTapSignerWallet(tapSigner: ts)
+    }
+
+    public func getTapSignerBackup(_ ts: TapSigner) throws -> Data? {
+        try rust.getTapSignerBackup(tapSigner: ts)
+    }
+
+    public func saveTapSignerBackup(_ ts: TapSigner, _ backup: Data) -> Bool {
+        rust.saveTapSignerBackup(tapSigner: ts, backup: backup)
+    }
+
+    /// Reset the manager state
+    public func reset() {
+        rust = FfiApp()
+        database = Database()
+        walletManager = nil
+
+        let state = rust.state()
+        router = state.router
+    }
+
+    /// Reload wallets from database (e.g. after cloud restore)
+    func reloadWallets() {
+        wallets = (try? database.wallets().all()) ?? []
+        walletManager = nil
+    }
+
+    var currentRoute: Route {
+        router.routes.last ?? router.default
+    }
+
+    var hasWallets: Bool {
+        rust.hasWallets()
+    }
+
+    var numberOfWallets: Int {
+        Int(rust.numWallets())
+    }
+
+    /// this will select the wallet and reset the route to the selectedWalletRoute
+    func selectWallet(_ id: WalletId) {
+        do {
+            try rust.selectWallet(id: id)
+            isSidebarVisible = false
+        } catch {
+            Log.error("Unabel to select wallet \(id), error: \(error)")
+        }
+    }
+
+    func toggleSidebar() {
+        isSidebarVisible.toggle()
+    }
+
+    func loadWallets() {
+        wallets = (try? database.wallets().all()) ?? []
+    }
+
+    func pushRoute(_ route: Route) {
+        isSidebarVisible = false
+        router.routes.append(route)
+    }
+
+    func pushRoutes(_ routes: [Route]) {
+        isSidebarVisible = false
+        router.routes.append(contentsOf: routes)
+    }
+
+    func popRoute() {
+        router.routes.removeLast()
+    }
+
+    func setRoute(_ routes: [Route]) {
+        router.routes = routes
+    }
+
+    func scanQr() {
+        sheetState = TaggedItem(.qr)
+    }
+
+    func setCloudBackupRootPromptBlocker(
+        _ blocker: CloudBackupRootPromptBlocker,
+        isActive: Bool
+    ) {
+        if isActive {
+            cloudBackupRootPromptBlockers.insert(blocker)
+        } else {
+            cloudBackupRootPromptBlockers.remove(blocker)
+        }
+    }
+
+    func clearCloudBackupRootPromptBlockers(_ blockers: [CloudBackupRootPromptBlocker]) {
+        for blocker in blockers {
+            cloudBackupRootPromptBlockers.remove(blocker)
+        }
+    }
+
+    @MainActor
+    func resetRoute(to routes: [Route]) {
+        guard routes.count > 1 else { return resetRoute(to: routes[0]) }
+        rust.resetNestedRoutesTo(defaultRoute: routes[0], nestedRoutes: Array(routes[1...]))
+    }
+
+    func resetRoute(to route: Route) {
+        rust.resetDefaultRouteTo(route: route)
+    }
+
+    @MainActor
+    func loadAndReset(to route: Route) {
+        rust.loadAndResetDefaultRoute(route: route)
+    }
+
+    func agreeToTerms() {
+        self.dispatch(action: .acceptTerms)
+        withAnimation { isTermsAccepted = true }
+    }
+
+    func reconcile(message: AppStateReconcileMessage) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            logger.debug("Update: \(message)")
+
+            switch message {
+            case let .routeUpdated(routes: routes):
+                router.routes = routes
+
+            case let .pushedRoute(route):
+                router.routes.append(route)
+
+            case .databaseUpdated:
+                database = Database()
+
+            case let .colorSchemeChanged(colorSchemeSelection):
+                self.colorSchemeSelection = colorSchemeSelection
+
+            case let .selectedNodeChanged(node):
+                selectedNode = node
+
+            case let .selectedNetworkChanged(network):
+                selectedNetwork = network
+                loadWallets()
+
+            case let .defaultRouteChanged(route, nestedRoutes):
+                router.routes = nestedRoutes
+                router.default = route
+                routeId = UUID()
+
+            case let .fiatPricesChanged(prices):
+                self.prices = prices
+
+            case let .feesChanged(fees):
+                self.fees = fees
+
+            case let .fiatCurrencyChanged(fiatCurrency):
+                selectedFiatCurrency = fiatCurrency
+
+                // refresh fiat values in the wallet manager
+                if let walletManager {
+                    Task {
+                        await walletManager.forceWalletScan()
+                        await walletManager.updateWalletBalance()
+                    }
+                }
+
+            case .acceptedTerms:
+                isTermsAccepted = true
+
+            case .walletModeChanged:
+                isLoading = true
+                loadWallets()
+
+                Task {
+                    try? await Task.sleep(for: .milliseconds(walletModeChangeDelayMs))
+                    await MainActor.run {
+                        withAnimation { self.isLoading = false }
+                    }
+                }
+
+            case .walletsChanged:
+                wallets = (try? database.wallets().all()) ?? []
+
+            case let .clearCachedWalletManager(walletId):
+                if walletManager?.id == walletId { walletManager = nil }
+
+            case .showLoadingPopup:
+                Task { await MiddlePopup(state: .loading).present() }
+
+            case .hideLoadingPopup:
+                Task { await PopupStack.dismissAllPopups() }
+            }
+        }
+    }
+
+    public func dispatch(action: AppAction) {
+        logger.debug("dispatch \(action)")
+        rust.dispatch(action: action)
+    }
+}

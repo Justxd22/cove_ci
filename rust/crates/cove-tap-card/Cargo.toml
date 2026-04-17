@@ -1,0 +1,22 @@
+[package]
+name = "cove-tap-card"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Bitcoin dependencies
+bitcoin = { workspace = true, features = ["serde"] }
+
+# Serialization/Deserialization
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_urlencoded = { workspace = true }
+
+# Utilities
+tracing = { workspace = true }
+thiserror = { workspace = true }
+data-encoding = { workspace = true }
+hex = { workspace = true }
+derive_more = { workspace = true, features = ["display"] }
+
+# Uniffi for FFI
+uniffi = { workspace = true, features = ["tokio"] }

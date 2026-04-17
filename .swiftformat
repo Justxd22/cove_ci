@@ -1,0 +1,7 @@
+--exclude ios/CoveCore/Sources/CoveCore/generated
+--exclude rust/bindings
+--exclude ios/CoveCore/Sources/cove_core_ffi.xcframework
+--disable redundantSelf
+--disable redundantPublic
+--disable redundantNilInit
+--swiftversion 6.0

@@ -1,0 +1,291 @@
+import SwiftUI
+
+extension WeakReconciler: WalletManagerReconciler where Reconciler == WalletManager {}
+
+@Observable final class WalletManager: AnyReconciler, WalletManagerReconciler {
+    typealias Message = WalletManagerReconcileMessage
+    typealias Action = WalletManagerAction
+
+    private let logger = Log(id: "WalletManager")
+
+    let id: WalletId
+    @ObservationIgnored
+    let rust: RustWalletManager
+
+    var walletMetadata: WalletMetadata
+    var loadState: WalletLoadState
+    var balance: Balance = .zero()
+    var foundAddresses: [FoundAddress] = []
+    var unsignedTransactions: [UnsignedTransaction] = []
+
+    /// general wallet errors
+    var errorAlert: WalletErrorAlert? = nil
+
+    /// errors in SendFlow
+    var sendFlowErrorAlert: TaggedItem<SendFlowErrorAlert>? = nil
+
+    /// cached transaction details
+    var transactionDetails: [TxId: TransactionDetails] = [:]
+
+    /// scroll position for transaction list (persists across navigation)
+    var scrolledTransactionId: String?
+
+    init(id: WalletId) throws {
+        self.id = id
+        let rust = try RustWalletManager(id: id)
+
+        self.rust = rust
+        self.loadState = rust.initialLoadState()
+
+        walletMetadata = rust.walletMetadata()
+        unsignedTransactions = (try? rust.getUnsignedTransactions()) ?? []
+
+        rust.listenForUpdates(reconciler: WeakReconciler(self))
+    }
+
+    init(xpub: String) throws {
+        let rust = try RustWalletManager.tryNewFromXpub(xpub: xpub)
+        let metadata = rust.walletMetadata()
+
+        self.rust = rust
+        self.loadState = .loading
+        walletMetadata = metadata
+        id = metadata.id
+
+        rust.listenForUpdates(reconciler: WeakReconciler(self))
+    }
+
+    init(tapSigner: TapSigner, deriveInfo: DeriveInfo, backup: Data? = nil) throws {
+        let rust = try RustWalletManager.tryNewFromTapSigner(
+            tapSigner: tapSigner, deriveInfo: deriveInfo, backup: backup
+        )
+
+        let metadata = rust.walletMetadata()
+
+        self.rust = rust
+        self.loadState = .loading
+        walletMetadata = metadata
+        id = metadata.id
+
+        rust.listenForUpdates(reconciler: WeakReconciler(self))
+    }
+
+    var unit: String {
+        switch walletMetadata.selectedUnit {
+        case .btc: "btc"
+        case .sat: "sats"
+        }
+    }
+
+    var hasTransactions: Bool {
+        switch loadState {
+        case .loading: false
+        case let .scanning(txns): !txns.isEmpty
+        case let .loaded(txns): !txns.isEmpty
+        }
+    }
+
+    var isVerified: Bool {
+        walletMetadata.verified
+    }
+
+    var accentColor: Color {
+        walletMetadata.swiftColor
+    }
+
+    func validateMetadata() {
+        rust.validateMetadata()
+    }
+
+    func forceWalletScan() async {
+        await rust.forceWalletScan()
+    }
+
+    func firstAddress() async throws -> AddressInfo {
+        try await rust.addressAt(index: 0)
+    }
+
+    func amountFmt(_ amount: Amount) -> String {
+        switch walletMetadata.selectedUnit {
+        case .btc:
+            amount.btcString()
+        case .sat:
+            amount.satsString()
+        }
+    }
+
+    func displayAmount(_ amount: Amount, showUnit: Bool = true) -> String {
+        self.rust.displayAmount(amount: amount, showUnit: showUnit)
+    }
+
+    func amountFmtUnit(_ amount: Amount) -> String {
+        switch walletMetadata.selectedUnit {
+        case .btc: amount.btcStringWithUnit()
+        case .sat: amount.satsStringWithUnit()
+        }
+    }
+
+    func transactionDetails(for txId: TxId) async throws -> TransactionDetails {
+        if let details = transactionDetails[txId] {
+            return details
+        }
+
+        let details = try await rust.transactionDetails(txId: txId)
+        transactionDetails[txId] = details
+
+        return details
+    }
+
+    func updateTransactionDetailsCache(txId: TxId, details: TransactionDetails) {
+        transactionDetails[txId] = details
+    }
+
+    func updateWalletBalance() async {
+        let balance = await rust.balance()
+        await MainActor.run {
+            self.balance = balance
+        }
+    }
+
+    func apply(_ message: Message) {
+        switch message {
+        case .startedInitialFullScan:
+            switch self.loadState {
+            case let .scanning(txns) where !txns.isEmpty:
+                break
+            case let .loaded(txns):
+                self.loadState = .scanning(txns)
+            default:
+                self.loadState = .loading
+            }
+
+        case let .startedExpandedFullScan(txns):
+            self.loadState = .scanning(txns)
+
+        case let .availableTransactions(txns):
+            switch self.loadState {
+            case .loading:
+                self.loadState = .scanning(txns)
+            case let .scanning(current) where txns.count >= current.count:
+                self.loadState = .scanning(txns)
+            case .scanning:
+                break
+            case let .loaded(current) where txns.count >= current.count:
+                self.loadState = .scanning(txns)
+            case .loaded:
+                break
+            }
+
+        case let .updatedTransactions(txns):
+            switch self.loadState {
+            case .scanning, .loading:
+                self.loadState = .scanning(txns)
+            case .loaded:
+                self.loadState = .loaded(txns)
+            }
+
+        case let .scanComplete(txns):
+            self.loadState = .loaded(txns)
+
+        case let .walletBalanceChanged(balance):
+            withAnimation { self.balance = balance }
+
+        case .unsignedTransactionsChanged:
+            self.unsignedTransactions = (try? rust.getUnsignedTransactions()) ?? []
+
+        case let .walletMetadataChanged(metadata):
+            withAnimation { self.walletMetadata = metadata }
+            setWalletMetadata(metadata)
+
+        case let .walletScannerResponse(scannerResponse):
+            self.logger.debug("walletScannerResponse: \(scannerResponse)")
+            if case let .foundAddresses(addressTypes) = scannerResponse {
+                self.foundAddresses = addressTypes
+            }
+
+        case let .nodeConnectionFailed(error):
+            self.errorAlert = WalletErrorAlert.nodeConnectionFailed(error)
+            self.logger.error(error)
+            self.logger.error("set errorAlert")
+
+        case let .walletError(error):
+            self.logger.error("WalletError \(error)")
+
+        case let .unknownError(error):
+            // TODO: show to user
+            self.logger.error("Unknown error \(error)")
+
+        case let .sendFlowError(error):
+            self.sendFlowErrorAlert = TaggedItem(error)
+
+        case let .hotWalletKeyMissing(walletId):
+            AppManager.shared.alertState = .init(.hotWalletKeyMissing(walletId: walletId))
+        }
+    }
+
+    private let rustBridge = DispatchQueue(
+        label: "cove.walletmanager.rustbridge", qos: .userInitiated
+    )
+
+    private func setWalletMetadata(_ metadata: WalletMetadata) {
+        rustBridge.async { [weak self] in
+            self?.rust.setWalletMetadata(metadata: metadata)
+        }
+    }
+
+    func reconcile(message: Message) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            logger.debug("reconcile \(message)")
+            self.apply(message)
+        }
+    }
+
+    func reconcileMany(messages: [Message]) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            logger.debug("reconcile_messages: \(messages)")
+            messages.forEach { self.apply($0) }
+        }
+    }
+
+    func dispatch(action: Action) {
+        dispatch(action)
+    }
+
+    func dispatch(_ action: Action) {
+        rustBridge.async { [weak self] in
+            self?.logger.debug("dispatch: \(action)")
+            self?.rust.dispatch(action: action)
+        }
+    }
+
+    /// PREVIEW only
+    init(preview: String, _ walletMetadata: WalletMetadata? = nil) {
+        assert(preview == "preview_only")
+
+        id = WalletId()
+        let rust =
+            if let walletMetadata {
+                RustWalletManager.previewNewWalletWithMetadata(metadata: walletMetadata)
+            } else {
+                RustWalletManager.previewNewWallet()
+            }
+
+        self.rust = rust
+        self.loadState = .loading
+        self.walletMetadata = rust.walletMetadata()
+
+        rust.listenForUpdates(reconciler: WeakReconciler(self))
+    }
+
+    deinit {
+        logger.debug("WalletManager deinit called for wallet \(id)")
+    }
+}
+
+extension WalletLoadState: @retroactive Equatable {
+    public static func == (lhs: WalletLoadState, rhs: WalletLoadState) -> Bool {
+        lhs.isEqual(other: rhs)
+    }
+}

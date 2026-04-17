@@ -1,0 +1,227 @@
+import SwiftUI
+
+struct WalletSettingsView: View {
+    @Environment(AppManager.self) private var app
+    @Environment(\.navigate) private var navigate
+    @Environment(\.dismiss) private var dismiss
+
+    let manager: WalletManager
+
+    @State private var showingDeleteConfirmation = false
+    @State private var showingSecretWordsConfirmation = false
+    @State private var showingSecondDeleteConfirmation = false
+    @State private var showingFinalDeleteConfirmation = false
+    @State private var requiredConfirmations: UInt8 = 1
+
+    init(manager: WalletManager) {
+        self.manager = manager
+    }
+
+    var metadata: WalletMetadata {
+        manager.walletMetadata
+    }
+
+    var deleteConfirmationMessage: String {
+        manager.rust.deletionWarningMessage()
+    }
+
+    let colorColumns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 5)
+
+    private func deleteWallet() {
+        do {
+            try manager.rust.deleteWallet()
+            dismiss()
+        } catch {
+            Log.error("Unable to delete wallet: \(error)")
+        }
+    }
+
+    var body: some View {
+        List {
+            Section(header: Text("Wallet Information")) {
+                HStack {
+                    Text("Network")
+                    Spacer()
+                    Text(metadata.network.description)
+                        .foregroundColor(.secondary)
+                }
+                .font(.subheadline)
+
+                if let masterFingerprint = manager.rust.masterFingerprint(), !metadata.isTapSigner() {
+                    HStack {
+                        Text("Fingerprint")
+                        Spacer()
+                        Text(masterFingerprint)
+                            .foregroundColor(.secondary)
+                    }
+                    .font(.subheadline)
+                }
+
+                if case let .tapSigner(t) = metadata.hardwareMetadata {
+                    HStack {
+                        Text("Card Identifier")
+                        Spacer()
+                        Text(t.fullCardIdent())
+                            .foregroundColor(.secondary)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .font(.subheadline)
+                }
+
+                HStack {
+                    Text("Wallet Type")
+                    Spacer()
+                    Text(String(metadata.walletType))
+                        .foregroundColor(.secondary)
+                }
+                .font(.subheadline)
+            }
+
+            Section(header: Text("Settings")) {
+                HStack {
+                    Text("Name")
+                    Spacer()
+
+                    Text(metadata.name)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                    Image(systemName: "chevron.right")
+                        .foregroundColor(Color(UIColor.tertiaryLabel))
+                        .font(.footnote)
+                        .fontWeight(.semibold)
+                }
+                .contentShape(Rectangle())
+                .font(.subheadline)
+                .onTapGesture {
+                    app.pushRoute(Route.settings(.wallet(id: metadata.id, route: .changeName)))
+                }
+
+                VStack(spacing: 14) {
+                    HStack {
+                        Text("Wallet Color")
+                            .font(.subheadline)
+                        Spacer()
+                    }
+
+                    HStack {
+                        Rectangle()
+                            .fill(metadata.swiftColor)
+                            .cornerRadius(10)
+                            .frame(width: 80, height: 80)
+
+                        LazyVGrid(columns: colorColumns, spacing: 20) {
+                            ForEach(defaultWalletColors(), id: \.self) { color in
+                                ZStack {
+                                    if color == metadata.color {
+                                        Circle()
+                                            .stroke(Color(color).opacity(0.7), lineWidth: 2)
+                                            .frame(width: 32, height: 32)
+                                    }
+
+                                    Circle()
+                                        .fill(Color(color))
+                                        .frame(width: 28, height: 28)
+                                        .contentShape(Rectangle())
+                                }
+                                .onTapGesture { manager.dispatch(action: .updateColor(color)) }
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(.vertical, 8)
+
+                VStack {
+                    Toggle(isOn: Binding(
+                        get: { manager.walletMetadata.showLabels },
+                        set: { _ in manager.dispatch(action: .toggleShowLabels) }
+                    )) {
+                        Text("Show transaction labels")
+                            .font(.subheadline)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+
+            Section(header: Text("Danger Zone")) {
+                if manager.walletMetadata.walletType == .hot {
+                    Button {
+                        showingSecretWordsConfirmation = true
+                    } label: {
+                        Text("View Secret Words")
+                            .font(.subheadline)
+                    }
+                    .confirmationDialog("Are you sure?", isPresented: $showingSecretWordsConfirmation) {
+                        Button("Show Me") {
+                            app.pushRoute(Route.secretWords(manager.walletMetadata.id))
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text(
+                            "Whoever has access to your secret words, has access to your bitcoin. Please keep these safe, don't show them to anyone."
+                        )
+                    }
+                }
+
+                Button {
+                    requiredConfirmations = manager.rust.requiredDeletionConfirmations()
+                    showingDeleteConfirmation = true
+                } label: {
+                    Text("Delete Wallet").foregroundStyle(.red)
+                        .font(.subheadline)
+                }
+                .confirmationDialog("Are you sure?", isPresented: $showingDeleteConfirmation) {
+                    Button("Delete", role: .destructive) {
+                        if requiredConfirmations >= 2 {
+                            showingSecondDeleteConfirmation = true
+                        } else {
+                            deleteWallet()
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(deleteConfirmationMessage)
+                }
+                .alert("Confirm Deletion", isPresented: $showingSecondDeleteConfirmation) {
+                    Button("Delete", role: .destructive) {
+                        if requiredConfirmations >= 3 {
+                            showingFinalDeleteConfirmation = true
+                        } else {
+                            deleteWallet()
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Are you sure you want to delete '\(metadata.name)'?")
+                }
+                .alert("Final Warning", isPresented: $showingFinalDeleteConfirmation) {
+                    Button("Delete Forever", role: .destructive) {
+                        deleteWallet()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This wallet is not backed up and contains funds. You will lose access to these funds forever.")
+                }
+            }
+        }
+        .navigationTitle(manager.walletMetadata.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .foregroundColor(.primary)
+        .onDisappear { manager.validateMetadata() }
+        .onAppear { manager.validateMetadata() }
+        .scrollContentBackground(.hidden)
+    }
+}
+
+#Preview {
+    AsyncPreview {
+        WalletSettingsView(manager: WalletManager(preview: "preview_only"))
+            .environment(AppManager.shared)
+            .environment(\.navigate) { _ in
+                ()
+            }
+            .background(Color(UIColor.systemGroupedBackground))
+    }
+}

@@ -1,0 +1,196 @@
+# Cove Architecture
+
+## TL;DR
+
+- The Rust crate in `rust/` is the single source of truth for wallet logic, networking, persistence, and hardware integrations. BDK is the main library powering all things bitcoin-related.
+- SwiftUI (iOS) and Jetpack Compose (Android) UIs talk to the Rust core through “Managers”, lightweight view-models that own the generated FFI objects, subscribe to reconciliation callbacks, and expose platform-friendly state.
+- All cross-platform bindings are generated with UniFFI via custom scripts that live in `scripts/` and Just recipes; `just build-ios` and `just build-android` rebuild the Rust core, regenerate bindings, and drop artifacts into the mobile projects.
+
+---
+
+## Table of Contents
+
+- [Rust Core](#rust-core)
+- [UniFFI Bindings](#uniffi-bindings)
+- [Mobile Frontends](#mobile-frontends)
+- [Extending the Core](#extending-the-core)
+- [Quick Pointers](#quick-pointers)
+
+> **Getting Started?** See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions and development workflow.
+
+---
+
+## Rust Core
+
+**Layout.** The top-level crate (`rust/src/lib.rs`) re-exports a collection of domain-focused modules (wallets, routing, hardware, fiat, etc.) plus internal crates under `rust/crates/`. Everything compiles into `libcove.{a,so}` and the `coveffi` cdylib specified in `rust/uniffi.toml`.
+
+**Internal crates** (`rust/crates/`):
+
+- `cove-bdk` - BDK wallet functionality wrappers
+- `cove-bip39` - BIP39 mnemonic handling
+- `cove-common` - Shared constants and utilities
+- `cove-device` - Platform abstraction for keychain and device features
+- `cove-macros` - Common Macros used by the other crates
+- `cove-nfc` - NFC communication protocols
+- `cove-tap-card` - TAPSIGNER/SATSCARD integration
+- `cove-types` - Shared type definitions
+- `cove-util` - General utilities (formatting, logging, result extensions)
+- `uniffi_cli` - Custom UniFFI CLI wrapper for binding generation
+
+**Async runtime.** The core is async-first: a Tokio runtime is initialised from the host app (`task::init_tokio`) and reused via a global `OnceLock`. Host apps must invoke `FfiApp::init_on_start` once after creating the app object (see the `.task { await app.rust.initOnStart() }` block in `ios/Cove/CoveApp.swift`) before dispatching actions so background tasks and caches spin up correctly.
+
+**Actor system.** Long-lived concurrent components use `act-zero` actors spawned onto the shared Tokio runtime. Use `task::spawn_actor()` to create actors.
+
+Key actors include:
+
+- `WalletActor` (`rust/src/manager/wallet_manager/actor.rs`) - Manages wallet state and operations
+- `WalletScanner` - Handles blockchain scanning and syncing
+
+Actors are ideal for components that need to process messages sequentially, maintain internal state, and send reconciliation updates back to the UI when work completes.
+
+**Singleton pattern.** Many core components use singleton patterns for global access, implemented via `OnceLock`, `LazyLock`, or `ArcSwap`. Creating new instances returns cheap clones (typically `Arc` clones) of the global singleton, similar to how `AppManager.shared` works on iOS or `AppManager.getInstance()` on Android. Key singletons include:
+
+- `Database::global()` (`rust/src/database.rs`) - Database access via `OnceCell<ArcSwap<Database>>`. Calling `Database()` from Kotlin/Swift returns an `Arc` clone of the global instance.
+- `App::global()` (`rust/src/app.rs`) - Application state and routing coordinator via `OnceCell<App>`.
+- `FfiApp::global()` (`rust/src/app.rs`) - FFI wrapper for app, always returns a new `Arc<Self>` that accesses `App::global()`.
+- `AUTH_MANAGER` (`rust/src/manager/auth_manager.rs`) - Authentication manager via `LazyLock<Arc<RustAuthManager>>`.
+- `Keychain::global()` (`rust/crates/cove-device/src/keychain.rs`) - Platform keychain access via `OnceCell`, initialized once by the host app.
+- `Device::global()` (`rust/crates/cove-device/src/device.rs`) - Device capabilities access via `OnceCell`, initialized once by the host app.
+- `FIAT_CLIENT` (`rust/src/fiat/client.rs`) - Price fetching client via `LazyLock<FiatClient>`.
+- `FEE_CLIENT` (`rust/src/fee_client.rs`) - Fee estimation client via `LazyLock<FeeClient>`.
+- `PRICES` & `FEES` - Thread-safe cached data via `LazyLock<ArcSwap<Option<T>>>` for lock-free reads with atomic updates.
+
+This pattern is used throughout the codebase for shared resources and is safe to use from any thread. Platform code mirrors this with `AppManager.shared` (iOS) and `AppManager.getInstance()` (Android).
+
+**Concurrency primitives.** The codebase uses `parking_lot::Mutex` and `parking_lot::RwLock` everywhere — use these instead of `std::sync` equivalents to keep things consistent.
+
+**State reconciliation.** Each manager module owns a `flume` channel pair. Rust emits typed `…ReconcileMessage` enums through the channel, and the generated FFI surface forwards them to the platform reconcilers. Platform managers should call `listen_for_updates` immediately after instantiating their Rust counterpart (e.g. `AppManager` in `ios/Cove/AppManager.swift`) so no reconciliation messages are missed. Long-lived managers (wallet, send flow, auth) also keep shared state in `Arc<RwLock<_>>` structures so the reconciler can request snapshots. When a manager exposes `state()`, treat it as an initial snapshot/bootstrap read. Ongoing reconciliation should use typed delta messages for individual fields or events rather than re-sending the whole state after each mutation. If one action updates several fields, compute the changes under the lock, then send the delta messages after releasing the lock.
+
+**Dispatching from Rust.** When Rust code needs to dispatch `AppAction`, use `DeferredDispatch<T>` (`rust/src/manager/deferred_dispatch.rs`) instead of calling dispatch directly. This queues actions and dispatches them when the struct drops, ensuring dispatch happens after any locks are released and avoiding potential deadlocks. The `ffi_dispatch` method on `FfiApp` is intentionally named to discourage direct Rust usage—iOS/Android see it as `dispatch` via UniFFI renaming.
+
+**Routing & application shell.** `rust/src/app.rs` defines `App`, the singleton that coordinates routing, fees/prices, network selection, and terms acceptance. Its `FfiApp` wrapper implements the UniFFI object exposed to the UI. Route updates use `AppStateReconcileMessage` callbacks to keep Kotlin/Swift state in sync.
+
+**Persistence.** Non-sensitive data is stored with [`redb`](https://crates.io/crates/redb) (`rust/src/database.rs`). Database file defaults to `$ROOT_DATA_DIR/cove.db` where `ROOT_DATA_DIR` is defined in `cove-common/src/consts.rs`.
+
+**Database tables:**
+
+- `GlobalFlagTable` - Feature flags and terms acceptance status
+- `GlobalConfigTable` - Network selection, node configuration, color scheme preferences
+- `GlobalCacheTable` - Cached data for performance optimization
+- `WalletsTable` - Wallet metadata and configuration
+- `UnsignedTransactionsTable` - Pending transactions awaiting signature
+- `HistoricalPriceTable` - Historical price data for fiat conversions
+
+**Keychain.** Secrets are stored in OS-native keychains via the `KeychainAccess` trait (`rust/crates/cove-device/src/keychain.rs`). This is a UniFFI callback interface that platform code implements - iOS provides the implementation using the iOS Keychain, and Android uses Android KeyStore. Rust code accesses it via `Keychain::global()`, which internally delegates to the platform implementation. The keychain supports encryption/decryption through the `Cryptor` from `cove-util`.
+
+**Wallet & hardware integrations.** BDK powers transaction management (`rust/src/wallet`, `rust/src/transaction`). TAPSIGNER/SATSCARD + NFC flows live in `rust/src/tap_card` and the dedicated crates under `rust/crates/`. The utilities crate (`cove-util`) concentrates helpers such as result extensions, formatting, and logging.
+
+---
+
+## UniFFI Bindings
+
+- `rust/uniffi.toml` names the shared library (`coveffi`) and the Kotlin package (`org.bitcoinppl.cove_core`).
+- `cargo run -p uniffi_cli` invokes the custom CLI wrapper that ships with this repo (`rust/crates/uniffi_cli`). The CLI understands both Swift and Kotlin targets and emits consistent module names (`cove_core_ffi`, `cove.kt`).
+- **Binding generation flow:**
+  - First, bindings are generated into `rust/bindings/` (intermediate, temporary location)
+  - Swift: Copied from `rust/bindings/*.swift` → `ios/CoveCore/Sources/CoveCore/generated/`
+  - Kotlin: Copied from `rust/bindings/kotlin/` → `android/app/src/main/java/org/bitcoinppl/cove_core/`
+  - The build scripts (`scripts/build-ios.sh`, `scripts/build-android.sh`) handle this copying automatically
+
+**Android-specific notes:**
+
+- UniFFI automatically transforms Rust error types ending in `Error` to `Exception` when generating Kotlin bindings (e.g., `SendFlowError` becomes `SendFlowException`). This is standard Kotlin convention where exceptions extend `kotlin.Exception`.
+- Rust enum variants use **tuple-style** (unnamed fields), which UniFFI translates to generic `v1`, `v2`, `v3` field names in Kotlin (e.g., `RouteUpdated(Vec<Route>)` becomes `data class RouteUpdated(val v1: List<Route>)`). In contrast, struct-style variants with named fields preserve those names (e.g., `WrongNetwork { address: String, validFor: Network, current: Network }` becomes `data class WrongNetwork(val address: String, val validFor: Network, val current: Network)`).
+- **Kotlin enum variant name collisions:** Avoid naming an enum variant the same as a type that a method returns. In Kotlin, UniFFI generates enums as sealed classes where variants become nested data classes. If an enum has both a variant named `Foo` and a method `fn foo() -> Option<Foo>` (returning a different `Foo` type), Kotlin resolves `Foo` within the sealed class scope to the variant, not the external type, causing a compile error. Solution: use distinct variant names (e.g., `SignedPsbt` instead of `Psbt` when there's also a `Psbt` type).
+- When you change any exported API (new method, enum, record), rebuild bindings through the `just` recipes described below so the mobile projects pick up the new code.
+
+---
+
+## Mobile Frontends
+
+> We aim for shared structure and terminology across platforms (same manager names, reconcile shapes, etc.) while still embracing each platform's native idioms for UI, navigation, typography, and interactions. Think "consistent architecture, platform-native experience."
+
+**Platform-specific UI examples:**
+- Settings rows: iOS favors inset grouped lists with `NavigationLink` chevrons, while Android uses full-width Material list items with ripple feedback and trailing metadata icons instead of chevrons.
+- Toggles: SwiftUI `Toggle` mirrors the iOS switch with a circular thumb and elastic animation; Compose uses `Switch` with a rectangular track, Material colors, and larger touch ripples.
+- Typography: iOS leans on SF Pro text styles (Title, Body, Footnote) and tighter letter spacing; Android uses Material 3 `TitleLarge`, `BodyMedium`, etc., aligning baseline grids to 4dp spacing.
+- Background treatments: iOS often uses blurred/grouped surfaces floating above a tinted system background; Android prefers flat `colorSurface` backgrounds with tonal elevation for cards or sections so dynamic color and dark theme transitions stay consistent.
+
+### iOS (SwiftUI)
+
+- The Swift Package `ios/CoveCore` wraps the generated bindings. `scripts/build-ios.sh` creates an XCFramework (`cove_core_ffi.xcframework`) and deposits generated Swift sources into the package.
+- `AppManager` (`ios/Cove/AppManager.swift`) is a singleton `@Observable` class that owns `FfiApp`, manages routing, and lazily instantiates other managers (wallet, send flow, etc.). Each manager wraps its `Rust…Manager` counterpart, registers itself as a reconciler, and updates SwiftUI-observable state on the main actor.
+- UI modules inject managers with `@Environment` or direct initialisers and call `dispatch(...)` for Rust-side actions. Reconcilers run updates on the main actor to keep SwiftUI safe.
+
+### Android (Jetpack Compose)
+
+- Compose screens obtain managers via `remember { ImportWalletManager() }` or DI and interact with them the same way SwiftUI does. The generated bindings (`android/app/src/main/java/org/bitcoinppl/cove_core/cove.kt`) expose suspending functions and listener hooks.
+- **Manager injection**: When iOS uses `@Environment` to inject managers, Android should pass managers directly as composable parameters. Derive state from managers and dispatch actions through them—avoid wrapping in state holder data classes. This keeps Android code structurally close to iOS while remaining idiomatic Compose.
+- Each Kotlin manager implements the generated `FfiReconcile` interface and creates its own lifecycle-aware coroutine scope (`Dispatchers.Main` + `SupervisorJob`). In `init`, managers create their Rust counterpart, call `listenForUpdates(this)`, and implement `reconcile(...)` to update Compose state or emit side-effects.
+- Shared navigation mirrors the Rust router: `RouterManager` listens for `RouteUpdated` events from the core and reconciles Compose navigation stacks.
+
+**State management patterns:**
+
+- **Use callbacks, not MutableState parameters**: While iOS uses `@Binding` extensively for two-way state binding, Android/Compose follows the "state down, events up" pattern with callbacks. Composables should accept value parameters (e.g., `value: String`) and callback parameters (e.g., `onValueChange: (String) -> Unit`), never `MutableState<T>` parameters.
+- **Why callbacks?** This follows official Android guidelines, matches standard library components (`TextField`, `Switch`, etc.), maintains unidirectional data flow, and makes previews easier. The codebase uses callbacks in 99% of components.
+- **Bidirectional sync**: When a child component needs to both read and write parent state, use `LaunchedEffect(parentValue) { childValue = parentValue }` to sync changes from parent to child, and callbacks to notify parent of child changes. While this creates boilerplate (~8 lines per field), it's the idiomatic Android pattern.
+- **Example pattern**:
+  ```kotlin
+  @Composable
+  fun MyComponent(
+      value: String,              // state down
+      onValueChange: (String) -> Unit,  // events up
+  ) {
+      var localValue by remember { mutableStateOf(value) }
+      LaunchedEffect(value) { localValue = value }  // sync parent → child
+
+      TextField(
+          value = localValue,
+          onValueChange = {
+              localValue = it
+              onValueChange(it)  // notify parent
+          }
+      )
+  }
+  ```
+
+**Manager ownership and cleanup:** Managers obtained via `app.getWalletManager()` or `app.getSendFlowManager()` are owned by `AppManager`—components should NOT call `.close()` on them. Only close managers created locally (e.g., `CoinControlManager`, `ImportWalletManager`, `TapSignerManager`). For short-lived managers like `LabelManager`, use `.use { }` for single operations or `DisposableEffect` with `.close()` if stored in state. `Database()` returns an Arc clone of a global singleton and doesn't need closing.
+
+**iOS ↔ Android parity patterns:** For detailed guidance on matching behavior across platforms (opacity, text colors, button centering, NFC scanning UI, etc.), see [docs/IOS_ANDROID_PARITY.md](docs/IOS_ANDROID_PARITY.md).
+
+### Manager Pattern (cross-platform)
+
+1. UI calls `manager.dispatch(action)` or a helper method (e.g. `importWallet`).
+2. The Swift/Kotlin manager forwards the call to `Rust…Manager` through the generated bindings.
+3. Rust mutates state, enqueues reconciliation messages, and optionally writes to redb or the keychain.
+4. The reconcilers on the UI thread receive the message and update observable state, triggering re-render.
+
+This pattern keeps business logic and validation centralized in Rust while giving each platform idiomatic state containers.
+
+---
+
+## Extending the Core
+
+- **New manager / feature flow:** Create a Rust manager module under `rust/src/manager/`, define its state, actions, and reconcile messages, and export it with `#[uniffi::export]`. Implement the matching Swift/Kotlin manager classes that conform to the generated `…Reconciler` protocol/interface.
+- **Routing additions:** Extend `rust/src/router.rs` enums, expose necessary helpers on `FfiApp`, and update the `RouterManager` on both platforms to handle the new routes.
+- **Database schema changes:** Update the relevant table builders under `rust/src/database/`. Because redb uses typed tables, add migration logic or regenerate tables as needed, and expose read/write helpers through UniFFI.
+- **Async work:** Prefer spawning onto the shared Tokio runtime via `task::spawn`. If the work belongs to a long-lived component, consider using an `act-zero` actor so you can push reconciliation messages back to the UI on completion.
+
+---
+
+## Quick Pointers
+
+- Rust exports live in `rust/src/**` and the supporting crates under `rust/crates/`.
+- Swift bindings land in `ios/CoveCore/Sources/CoveCore/generated/`; Kotlin bindings live (after copy) under `android/app/src/main/java/org/bitcoinppl/cove_core/`.
+- Database file defaults to `$ROOT_DATA_DIR/cove.db` (see `cove_common::consts::ROOT_DATA_DIR`).
+- Hardware / NFC helpers: `rust/crates/cove-device`, `rust/src/tap_card/`, and platform shims in `ios/Cove/FFI/` plus Android's `org.bitcoinppl.cove_core` package.
+
+---
+
+## iOS 26 SwiftUI Bugs & Workarounds
+
+### ToolbarItem(placement: .principal) — DO NOT USE
+
+SwiftUI has a bug on iOS 26 where `ToolbarPlacementEnvironment.updateValue()` enters an infinite loop during `_UINavigationParallaxTransition` (back button / swipe back) when a `.principal` toolbar item exists at large accessibility font sizes (specifically `accessibilityExtraExtraLarge`). This causes 100% CPU freeze.
+
+**Workaround:** For screens that need custom title content (icons, context menus, dynamic colors), use `.navigationTitleView { }` from `ios/Cove/Views/NavigationTitleView.swift`. This hosts SwiftUI content inside UIKit's `navigationItem.titleView`, bypassing SwiftUI's toolbar placement system entirely. For screens with plain static text titles, use `.navigationTitle("Title").navigationBarTitleDisplayMode(.inline)` instead.

@@ -1,0 +1,263 @@
+pub mod label;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use label::LabelsTable;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use redb::{ReadOnlyTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
+use crate::wallet::{WalletAddressType, metadata::WalletId};
+use cove_common::consts::WALLET_DATA_DIR;
+use cove_types::redb::Json;
+
+use ahash::AHashMap as HashMap;
+
+pub static DATABASE_CONNECTIONS: Lazy<RwLock<HashMap<WalletId, Arc<redb::Database>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn database_location(id: &WalletId, location: &Path) -> Result<PathBuf, std::io::Error> {
+    let dir = location.join(id.as_str());
+
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)?;
+    }
+
+    Ok(dir.join("wallet_data.encrypted.json.redb"))
+}
+
+pub(crate) const TABLE: TableDefinition<&'static str, Json<WalletData>> =
+    TableDefinition::new("wallet_data.json");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WalletData {
+    /// number of addresses scanned
+    ScanState(ScanState),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Enum)]
+pub enum WalletDataKey {
+    ScanState(WalletAddressType),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, uniffi::Enum)]
+pub enum ScanState {
+    NotStarted,
+    Scanning(ScanningInfo),
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, uniffi::Record)]
+pub struct ScanningInfo {
+    pub address_type: WalletAddressType,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct WalletDataDb {
+    pub id: WalletId,
+    pub db: Arc<redb::Database>,
+    pub labels: LabelsTable,
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi::export(Display)]
+pub enum WalletDataError {
+    #[error("Unable to access database for wallet {id}, error: {error}")]
+    DatabaseAccess { id: WalletId, error: String },
+
+    #[error("Unable to access table for wallet {id}, error: {error}")]
+    TableAccess { id: WalletId, error: String },
+
+    #[error("Unable to read: {0}")]
+    Read(String),
+
+    #[error("Unable to save: {0}")]
+    Save(String),
+
+    #[error("Unsupported database version for wallet {id}: {version}")]
+    UnsupportedVersion { id: WalletId, version: super::error::UnsupportedDbVersion },
+}
+
+pub type Error = WalletDataError;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl WalletDataDb {
+    /// Gets an existing database or creates a new one
+    pub fn new_or_existing(id: WalletId) -> Result<Self> {
+        Self::new_with_db_location(id, &WALLET_DATA_DIR)
+    }
+
+    fn new_with_db_location(id: WalletId, db_location: &Path) -> Result<Self> {
+        let db = get_or_create_database(&id, db_location)?;
+        let write_txn = db.begin_write().map_err(|e| WalletDataError::DatabaseAccess {
+            id: id.clone(),
+            error: e.to_string(),
+        })?;
+
+        // create table if it doesn't exist
+        write_txn
+            .open_table(TABLE)
+            .map_err(|e| WalletDataError::TableAccess { id: id.clone(), error: e.to_string() })?;
+        let labels = LabelsTable::new(db.clone(), &write_txn);
+
+        // commit the write transaction
+        write_txn.commit().map_err(|e| WalletDataError::DatabaseAccess {
+            id: id.clone(),
+            error: e.to_string(),
+        })?;
+
+        Ok(Self { id, db, labels })
+    }
+
+    pub fn get_scan_state(&self, address_type: WalletAddressType) -> Result<Option<ScanState>> {
+        let key = WalletDataKey::ScanState(address_type);
+        let value = self.get(key)?;
+
+        let Some(WalletData::ScanState(scan_state)) = value else {
+            return Ok(None);
+        };
+
+        Ok(Some(scan_state))
+    }
+
+    pub fn set_scan_state(
+        &self,
+        type_: WalletAddressType,
+        scan_state: impl Into<ScanState>,
+    ) -> Result<()> {
+        let scan_state = scan_state.into();
+        debug!("setting scan state for {type_:?}, scan_state: {scan_state:?}");
+
+        let key = WalletDataKey::ScanState(type_);
+        let value = WalletData::ScanState(scan_state);
+
+        self.set(key, value)
+    }
+
+    fn get(&self, key: WalletDataKey) -> Result<Option<WalletData>> {
+        let table = self.read_table()?;
+
+        let value = table
+            .get(key.as_str())
+            .map_err(|error| Error::Read(error.to_string()))?
+            .map(|value| value.value());
+
+        Ok(value)
+    }
+
+    fn set(&self, key: WalletDataKey, value: WalletData) -> Result<()> {
+        let write_txn = self.db.begin_write().map_err(|error| Error::DatabaseAccess {
+            id: self.id.clone(),
+            error: error.to_string(),
+        })?;
+
+        {
+            let mut table = write_txn.open_table(TABLE).map_err(|error| Error::TableAccess {
+                id: self.id.clone(),
+                error: error.to_string(),
+            })?;
+
+            table.insert(key.as_str(), value).map_err(|error| Error::Save(error.to_string()))?;
+        }
+
+        write_txn.commit().map_err(|error| Error::DatabaseAccess {
+            id: self.id.clone(),
+            error: error.to_string(),
+        })?;
+
+        Ok(())
+    }
+
+    fn read_table<'a>(&self) -> Result<ReadOnlyTable<&'a str, Json<WalletData>>, Error> {
+        let read_txn = self.db.begin_read().map_err(|error| Error::DatabaseAccess {
+            id: self.id.clone(),
+            error: error.to_string(),
+        })?;
+
+        let table = read_txn.open_table(TABLE).map_err(|error| Error::TableAccess {
+            id: self.id.clone(),
+            error: error.to_string(),
+        })?;
+
+        Ok(table)
+    }
+}
+
+/// Get an existing database or create a new one
+pub fn get_or_create_database(id: &WalletId, location: &Path) -> Result<Arc<redb::Database>> {
+    let path = database_location(id, location)
+        .map_err(|e| WalletDataError::DatabaseAccess { id: id.clone(), error: e.to_string() })?;
+
+    // check if we already have a database connection for this id and return it
+    {
+        let db_connections = DATABASE_CONNECTIONS.read();
+        if let Some(db) = db_connections.get(id) {
+            return Ok(db.clone());
+        }
+    }
+
+    let db = super::encrypted_backend::open_or_create_database(&path).map_err(|e| match e {
+        super::error::DatabaseError::UnsupportedVersion(version) => {
+            WalletDataError::UnsupportedVersion { id: id.clone(), version }
+        }
+        other => WalletDataError::DatabaseAccess { id: id.clone(), error: other.to_string() },
+    })?;
+
+    let mut db_connections = DATABASE_CONNECTIONS.write();
+    let db = Arc::new(db);
+    db_connections.insert(id.clone(), db.clone());
+
+    Ok(db)
+}
+
+pub fn delete_database(id: &WalletId) -> Result<(), std::io::Error> {
+    delete_database_at_location(id, &WALLET_DATA_DIR)
+}
+
+fn delete_database_at_location(id: &WalletId, location: &Path) -> Result<(), std::io::Error> {
+    {
+        let mut db_connections = DATABASE_CONNECTIONS.write();
+        db_connections.remove(id);
+    }
+
+    std::fs::remove_file(database_location(id, location)?)
+}
+
+impl WalletDataKey {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ScanState(WalletAddressType::NativeSegwit) => "scan_state_native_segwit",
+            Self::ScanState(WalletAddressType::WrappedSegwit) => "scan_state_wrapped_segwit",
+            Self::ScanState(WalletAddressType::Legacy) => "scan_state_legacy",
+        }
+    }
+}
+
+impl ScanningInfo {
+    pub const fn new(address_type: WalletAddressType) -> Self {
+        Self { address_type, count: 0 }
+    }
+}
+
+impl From<ScanningInfo> for ScanState {
+    fn from(info: ScanningInfo) -> Self {
+        Self::Scanning(info)
+    }
+}
+
+#[cfg(test)]
+impl WalletDataDb {
+    pub fn new_test(id: WalletId) -> (Self, tempfile::TempDir) {
+        super::encrypted_backend::set_test_encryption_key();
+        DATABASE_CONNECTIONS.write().remove(&id);
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let db = Self::new_with_db_location(id, tmp.path()).expect("failed to create test db");
+        (db, tmp)
+    }
+}

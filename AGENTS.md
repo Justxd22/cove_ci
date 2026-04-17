@@ -1,0 +1,10 @@
+The role of this file is to describe common mistakes and confusion points that agents might encounter as they work in this project. If you ever encounter something in the project that surprises you, please alert the developer working with you and indicate that this is the case in the AGENTS.md file to help prevent future agents from having the same issue.
+
+- Use `cove_util::ResultExt::map_err_str` instead of `.map_err(|e| Error::Variant(e.to_string()))` — it's cleaner and equivalent
+- Use `cove_util::ResultExt::map_err_prefix` instead of `.map_err(|e| Error::Variant(format!("context: {e}")))` when the prefix is a static string — produces `"context: error_message"`
+- For long-lived UI-facing managers, prefer `dispatch(action:)` for user intents and keep named methods for reads, bootstrap/lifecycle hooks, and special service-style operations.
+- For long-lived UI-facing managers, use `state()` for the initial snapshot only. Ongoing UI updates should use typed delta reconcile messages for fields/events instead of re-sending the whole state after every mutation
+- never use `pub(in ...)` or `pub(super)`; if non-private visibility is needed, use `pub(crate)` or `pub`
+- never manually edit generated files
+- no mod.rs files use the other format module_name.rs module_name/new_module.rs
+- adding `arti-client` naively currently causes a Cargo links conflict: Arti pulls `tor-dirmgr -> rusqlite 0.38 -> libsqlite3-sys 0.36` while Cove already uses `rusqlite 0.31 -> libsqlite3-sys 0.28`; Cargo rejects having two crates with `links = "sqlite3"` in the same final graph

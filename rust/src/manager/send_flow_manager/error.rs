@@ -1,0 +1,63 @@
+use cove_types::{Network, address::AddressError};
+
+use crate::manager::wallet_manager::WalletManagerError;
+
+#[derive(Debug, Clone, Eq, PartialEq, uniffi::Error, thiserror::Error)]
+#[uniffi::export(Display)]
+pub enum SendFlowError {
+    #[error("empty address")]
+    EmptyAddress,
+
+    #[error("invalid number")]
+    InvalidNumber,
+
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
+
+    #[error("wrong network {address} is for network: {valid_for}, current network: {current}")]
+    WrongNetwork { address: String, valid_for: Network, current: Network },
+
+    #[error("no balance")]
+    NoBalance,
+
+    #[error("zero amount")]
+    ZeroAmount,
+
+    #[error("insufficient funds")]
+    UnableToGetMaxSend(String),
+
+    #[error("insufficient funds")]
+    InsufficientFunds,
+
+    #[error("send amount to low")]
+    SendAmountToLow,
+
+    #[error("unable to get fee rate")]
+    UnableToGetFeeRate,
+
+    #[error("unable to build txn: {0}")]
+    UnableToBuildTxn(String),
+
+    #[error("unable to save unsigned transaction")]
+    UnableToSaveUnsignedTransaction(String),
+
+    #[error(transparent)]
+    WalletManager(#[from] WalletManagerError),
+
+    #[error("unable to get fee details: {0}")]
+    UnableToGetFeeDetails(String),
+}
+
+impl SendFlowError {
+    pub fn from_address_error(error: AddressError, address: String) -> Self {
+        match error {
+            AddressError::EmptyAddress => Self::EmptyAddress,
+            AddressError::InvalidAddress => Self::InvalidAddress(address),
+            AddressError::WrongNetwork { current, valid_for } => {
+                Self::WrongNetwork { address, valid_for, current }
+            }
+
+            _ => Self::InvalidAddress(address),
+        }
+    }
+}

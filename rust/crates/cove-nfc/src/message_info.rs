@@ -1,0 +1,30 @@
+#[derive(Debug, PartialEq, Eq, Clone, Copy, uniffi::Record)]
+pub struct MessageInfo {
+    /// The payload length of the message, including the header info
+    pub full_message_length: u16,
+
+    /// The payload length of the message, reported in the info header
+    /// This is the length of the payload, without the header info
+    pub payload_length: u16,
+}
+
+impl MessageInfo {
+    #[must_use]
+    pub const fn new(payload_length: u16) -> Self {
+        Self { payload_length, full_message_length: total_with_info(payload_length) }
+    }
+}
+
+const fn total_with_info(total_payload_length: u16) -> u16 {
+    // [226, 67, 0, 1, 0, 0, 4, 0, 3].len() == 9
+    let fixed_header_length: u16 = 9;
+    let payload_length_indicator_length = if total_payload_length < 255 {
+        1
+    } else {
+        // 1 byte (255) to indicate the length is longer than 255
+        // the length is encoded as a u16 (2 bytes)
+        3
+    };
+
+    total_payload_length + fixed_header_length + payload_length_indicator_length
+}

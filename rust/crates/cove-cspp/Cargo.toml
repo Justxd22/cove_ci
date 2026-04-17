@@ -1,0 +1,20 @@
+[package]
+name = "cove-cspp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cove-util = { path = "../cove-util" }
+
+arc-swap = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

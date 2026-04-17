@@ -1,0 +1,12 @@
+[package]
+name = "cove-bip39"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bip39 = { workspace = true, features = ["zeroize"] }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+num-bigint = { workspace = true }

@@ -1,0 +1,75 @@
+[package]
+name = "cove-types"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+## workspace dependencies
+# macros
+cove-macros = { path = "../cove-macros" }
+cove-ur = { path = "../cove-ur" }
+cove-util = { path = "../cove-util" }
+
+# bitcoin
+bitcoin = { workspace = true, features = ["serde"] }
+bdk_wallet = { workspace = true }
+
+# error handling
+thiserror = { workspace = true }
+eyre = { workspace = true }
+
+# logging
+tracing = { workspace = true }
+
+# serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# bbqr
+bbqr = { workspace = true }
+foundation-ur = { workspace = true }
+
+# database
+redb = { workspace = true }
+
+numfmt = { workspace = true }
+
+# strum
+strum = { workspace = true, features = ["derive"] }
+
+# timestamp
+jiff = { workspace = true, features = [] }
+
+# derive utilities
+derive_more = { workspace = true, features = [
+    "display",
+    "add",
+    "mul",
+    "from",
+    "into",
+    "as_ref",
+    "from_str",
+    "deref",
+    "deref_mut",
+] }
+
+# uniffi
+uniffi = { workspace = true, features = ["tokio"] }
+
+# ids
+nid = { workspace = true }
+
+# randomness
+rand = { workspace = true, features = ["std_rng"] }
+
+# encoding
+hex = { workspace = true }
+
+
+# util
+ahash = { workspace = true }
+tap = { workspace = true }
+url = { workspace = true }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }
