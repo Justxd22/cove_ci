@@ -18,8 +18,6 @@ jobs:
       BUNDLE_ID: org.bitcoinppl.cove
       SCHEME: Cove
       PROJECT_PATH: ios/Cove.xcodeproj
-      ARCHIVE_PATH: ${{ runner.temp }}/Cove.xcarchive
-      EXPORT_PATH: ${{ runner.temp }}/ipa
       TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
       CERT_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
     steps:
@@ -102,6 +100,8 @@ jobs:
 
       - name: Archive app
         run: |
+          ARCHIVE_PATH="$RUNNER_TEMP/Cove.xcarchive"
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> $GITHUB_ENV
           xcodebuild \
             -project "$PROJECT_PATH" \
             -scheme "$SCHEME" \
@@ -142,6 +142,8 @@ jobs:
 
       - name: Export IPA
         run: |
+          EXPORT_PATH="$RUNNER_TEMP/ipa"
+          echo "EXPORT_PATH=$EXPORT_PATH" >> $GITHUB_ENV
           mkdir -p "$EXPORT_PATH"
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
