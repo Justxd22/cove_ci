@@ -1,4 +1,4 @@
-name: iOS IPA CI
+name: iOS Unsigned IPA CI
 
 on:
   workflow_dispatch: {}
@@ -7,19 +7,16 @@ on:
       - ci/scratch
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
+  group: ios-unsigned-ipa-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-ios-ipa:
+  build-ios-unsigned-ipa:
     runs-on: macos-26
     timeout-minutes: 60
     env:
-      BUNDLE_ID: org.bitcoinppl.cove
       SCHEME: Cove
       PROJECT_PATH: ios/Cove.xcodeproj
-      TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
-      CERT_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,115 +56,45 @@ jobs:
           restore-keys: |
             deriveddata-${{ runner.os }}-
 
-      - name: Decode and validate signing certificate
-        run: |
-          python3 - <<'PY'
-          import base64, os, pathlib
-          data = os.environ.get("IOS_CERTIFICATE_P12_BASE64", "").strip()
-          if not data:
-              raise SystemExit("IOS_CERTIFICATE_P12_BASE64 is empty")
-          raw = base64.b64decode("".join(data.split()), validate=False)
-          pathlib.Path(os.environ["RUNNER_TEMP"], "cove_cert.p12").write_bytes(raw)
-          PY
-          openssl pkcs12 -in "$RUNNER_TEMP/cove_cert.p12" -nokeys -passin pass:"$CERT_PASSWORD" >/dev/null
-        env:
-          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
-
-      - name: Decode provisioning profile
-        run: |
-          python3 - <<'PY'
-          import base64, os, pathlib
-          data = os.environ.get("IOS_PROVISIONING_PROFILE_BASE64", "").strip()
-          if not data:
-              raise SystemExit("IOS_PROVISIONING_PROFILE_BASE64 is empty")
-          raw = base64.b64decode("".join(data.split()), validate=False)
-          pathlib.Path(os.environ["RUNNER_TEMP"], "cove.mobileprovision").write_bytes(raw)
-          PY
-        env:
-          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-
-      - name: Configure keychain and profile
-        run: |
-          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
-          KEYCHAIN_PASSWORD=$(uuidgen)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import $RUNNER_TEMP/cove_cert.p12 -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $RUNNER_TEMP/cove.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
-
-          PROFILE_PLIST=$RUNNER_TEMP/profile.plist
-          security cms -D -i $RUNNER_TEMP/cove.mobileprovision > "$PROFILE_PLIST"
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
-
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
-          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> $GITHUB_ENV
-          echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
-          echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
-
       - name: Build Rust iOS core
         run: just build-ios-release
 
-      - name: Archive app
+      - name: Build app for iphoneos without signing
         run: |
-          ARCHIVE_PATH="$RUNNER_TEMP/Cove.xcarchive"
-          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> $GITHUB_ENV
+          DERIVED_DATA_PATH="$RUNNER_TEMP/DerivedData"
+          APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release-iphoneos/Cove.app"
+          echo "DERIVED_DATA_PATH=$DERIVED_DATA_PATH" >> $GITHUB_ENV
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
           xcodebuild \
             -project "$PROJECT_PATH" \
             -scheme "$SCHEME" \
             -configuration Release \
-            -destination "generic/platform=iOS" \
-            -archivePath "$ARCHIVE_PATH" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
-            clean archive
+            -sdk iphoneos \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
-      - name: Create export options
+      - name: Package unsigned IPA
         run: |
-          cat > $RUNNER_TEMP/ExportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>development</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>teamID</key>
-            <string>${TEAM_ID}</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_NAME}</string>
-            </dict>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>compileBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "Expected app not found at $APP_PATH" >&2
+            exit 1
+          fi
+          IPA_DIR="$RUNNER_TEMP/ipa"
+          PAYLOAD_DIR="$IPA_DIR/Payload"
+          mkdir -p "$PAYLOAD_DIR"
+          cp -R "$APP_PATH" "$PAYLOAD_DIR/Cove.app"
+          (
+            cd "$IPA_DIR"
+            /usr/bin/zip -qry "Cove-unsigned.ipa" Payload
+          )
+          echo "IPA_OUTPUT=$IPA_DIR/Cove-unsigned.ipa" >> $GITHUB_ENV
 
-      - name: Export IPA
-        run: |
-          EXPORT_PATH="$RUNNER_TEMP/ipa"
-          echo "EXPORT_PATH=$EXPORT_PATH" >> $GITHUB_ENV
-          mkdir -p "$EXPORT_PATH"
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportPath "$EXPORT_PATH" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
-
-      - name: Upload IPA artifact
+      - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cove-ipa
-          path: ${{ env.EXPORT_PATH }}/*.ipa
+          name: cove-unsigned-ipa
+          path: ${{ env.IPA_OUTPUT }}
           if-no-files-found: error
