@@ -1,5 +1,4 @@
 import Foundation
-import CFNetwork
 import Network
 import SwiftUI
 
@@ -406,40 +405,229 @@ func testSocksEndpoint(host: String, port: Int, timeout: TimeInterval = 3) async
 }
 
 func testTorApiThroughSocks(host: String, port: Int, timeout: TimeInterval = 8) async -> Result<TorApiSnapshot, Error> {
-    do {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = timeout
-        configuration.connectionProxyDictionary = [
-            kCFNetworkProxiesSOCKSEnable as String: NSNumber(value: true),
-            kCFNetworkProxiesSOCKSProxy as String: host,
-            kCFNetworkProxiesSOCKSPort as String: NSNumber(value: port),
-        ]
+    guard (1...65535).contains(port) else {
+        return .failure(TorSupportError.invalidEndpoint)
+    }
 
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
+    return await withCheckedContinuation { continuation in
+        SocksTorApiProbe(
+            host: host,
+            port: port,
+            timeout: timeout,
+            continuation: continuation
+        ).start()
+    }
+}
 
-        guard let url = URL(string: "https://check.torproject.org/api/ip") else {
-            return .failure(TorSupportError.invalidEndpoint)
+private final class SocksTorApiProbe: @unchecked Sendable {
+    private let host: String
+    private let port: Int
+    private let timeout: TimeInterval
+    private let continuation: CheckedContinuation<Result<TorApiSnapshot, Error>, Never>
+    private let queue = DispatchQueue(label: "org.bitcoinppl.cove.tor.api-test")
+    private var connection: NWConnection?
+    private var finished = false
+
+    init(
+        host: String,
+        port: Int,
+        timeout: TimeInterval,
+        continuation: CheckedContinuation<Result<TorApiSnapshot, Error>, Never>
+    ) {
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.continuation = continuation
+    }
+
+    func start() {
+        guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            finish(.failure(TorSupportError.invalidEndpoint))
+            return
         }
 
-        let (data, response) = try await session.data(from: url)
-        guard let http = response as? HTTPURLResponse else {
-            return .failure(TorSupportError.notHTTP)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+        self.connection = connection
+        connection.stateUpdateHandler = { [self] state in
+            switch state {
+            case .ready:
+                sendSocksGreeting()
+            case let .failed(error):
+                finish(.failure(error))
+            case let .waiting(error):
+                if case .posix(.ECONNREFUSED) = error {
+                    finish(.failure(error))
+                }
+            default:
+                break
+            }
         }
-        guard (200..<300).contains(http.statusCode) else {
+
+        queue.asyncAfter(deadline: .now() + timeout) { [self] in
+            finish(.failure(TorSupportError.timeout))
+        }
+        connection.start(queue: queue)
+    }
+
+    private func finish(_ result: Result<TorApiSnapshot, Error>) {
+        guard !finished else { return }
+        finished = true
+        connection?.cancel()
+        continuation.resume(returning: result)
+    }
+
+    private func send(_ data: Data, then next: @escaping () -> Void) {
+        connection?.send(content: data, completion: .contentProcessed { [self] error in
+            if let error {
+                finish(.failure(error))
+                return
+            }
+            next()
+        })
+    }
+
+    private func receive(
+        minimumLength: Int,
+        maximumLength: Int,
+        then next: @escaping (Data) -> Void
+    ) {
+        connection?.receive(
+            minimumIncompleteLength: minimumLength,
+            maximumLength: maximumLength
+        ) { [self] data, _, _, error in
+            if let error {
+                finish(.failure(error))
+                return
+            }
+
+            guard let data, data.count >= minimumLength else {
+                finish(.failure(TorSupportError.invalidResponse))
+                return
+            }
+
+            next(data)
+        }
+    }
+
+    private func sendSocksGreeting() {
+        send(Data([0x05, 0x01, 0x00])) { [self] in
+            receive(minimumLength: 2, maximumLength: 2) { [self] data in
+                let bytes = [UInt8](data)
+                guard bytes.count == 2, bytes[0] == 0x05, bytes[1] == 0x00 else {
+                    finish(.failure(TorSupportError.invalidResponse))
+                    return
+                }
+                sendSocksConnectRequest()
+            }
+        }
+    }
+
+    private func sendSocksConnectRequest() {
+        let domain = "check.torproject.org"
+        guard let domainData = domain.data(using: .utf8), domainData.count < 256 else {
+            finish(.failure(TorSupportError.invalidEndpoint))
+            return
+        }
+
+        var request = Data([0x05, 0x01, 0x00, 0x03, UInt8(domainData.count)])
+        request.append(domainData)
+        request.append(contentsOf: [0x00, 0x50])
+
+        send(request) { [self] in
+            receiveSocksConnectResponseHeader()
+        }
+    }
+
+    private func receiveSocksConnectResponseHeader() {
+        receive(minimumLength: 4, maximumLength: 4) { [self] data in
+            let bytes = [UInt8](data)
+            guard bytes.count == 4, bytes[0] == 0x05, bytes[1] == 0x00 else {
+                finish(.failure(TorSupportError.invalidResponse))
+                return
+            }
+
+            switch bytes[3] {
+            case 0x01:
+                receiveAndDiscardSocksAddress(length: 6)
+            case 0x03:
+                receiveSocksDomainLength()
+            case 0x04:
+                receiveAndDiscardSocksAddress(length: 18)
+            default:
+                finish(.failure(TorSupportError.invalidResponse))
+            }
+        }
+    }
+
+    private func receiveSocksDomainLength() {
+        receive(minimumLength: 1, maximumLength: 1) { [self] data in
+            guard let length = data.first else {
+                finish(.failure(TorSupportError.invalidResponse))
+                return
+            }
+            receiveAndDiscardSocksAddress(length: Int(length) + 2)
+        }
+    }
+
+    private func receiveAndDiscardSocksAddress(length: Int) {
+        receive(minimumLength: length, maximumLength: length) { [self] _ in
+            sendTorApiHttpRequest()
+        }
+    }
+
+    private func sendTorApiHttpRequest() {
+        let request = [
+            "GET /api/ip HTTP/1.1",
+            "Host: check.torproject.org",
+            "Accept: application/json",
+            "Accept-Encoding: identity",
+            "Connection: close",
+            "",
+            "",
+        ].joined(separator: "\r\n")
+        send(Data(request.utf8)) { [self] in
+            receiveHttpResponse(Data())
+        }
+    }
+
+    private func receiveHttpResponse(_ accumulated: Data) {
+        connection?.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [self] data, _, isComplete, error in
+            if let error {
+                finish(.failure(error))
+                return
+            }
+
+            var nextData = accumulated
+            if let data {
+                nextData.append(data)
+            }
+
+            if isComplete || nextData.count > 128 * 1024 {
+                finish(parseTorApiHttpResponse(nextData))
+                return
+            }
+
+            receiveHttpResponse(nextData)
+        }
+    }
+
+    private func parseTorApiHttpResponse(_ data: Data) -> Result<TorApiSnapshot, Error> {
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        guard raw.hasPrefix("HTTP/1.1 200") || raw.hasPrefix("HTTP/1.0 200") else {
             return .failure(TorSupportError.invalidResponse)
         }
 
-        let raw = String(data: data, encoding: .utf8) ?? ""
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let body = raw.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
+        let bodyData = Data(body.utf8)
+        let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
         let isTor = (json?["IsTor"] as? Bool)
             ?? (json?["is_tor"] as? Bool)
-            ?? raw.lowercased().contains(#""istor":true"#)
+            ?? (body.range(
+                of: #""istor"\s*:\s*true"#,
+                options: [.caseInsensitive, .regularExpression]
+            ) != nil)
         let ip = json?["IP"] as? String
 
-        return .success(TorApiSnapshot(isTor: isTor, ip: ip, raw: raw))
-    } catch {
-        return .failure(error)
+        return .success(TorApiSnapshot(isTor: isTor, ip: ip, raw: body.isEmpty ? raw : body))
     }
 }

@@ -35,6 +35,36 @@ private struct StartupTorUnavailable: Equatable {
     }
 }
 
+private struct StartupTorWarningModifier: ViewModifier {
+    @Binding var warning: StartupTorUnavailable?
+    let openOrbot: () -> Void
+    let openNetworkSettings: () -> Void
+    let useClearnetNode: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(
+            warning?.title ?? "Tor unavailable",
+            isPresented: Binding(
+                get: { warning != nil },
+                set: { if !$0 { warning = nil } }
+            ),
+            presenting: warning
+        ) { warning in
+            if warning.mode == .orbot {
+                Button("Open Orbot", action: openOrbot)
+            }
+
+            Button("Network Settings", action: openNetworkSettings)
+            Button("Use clearnet node", role: .destructive, action: useClearnetNode)
+            Button("Ignore", role: .cancel) {
+                self.warning = nil
+            }
+        } message: { warning in
+            Text(warning.message)
+        }
+    }
+}
+
 struct CoveMainView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var phase
@@ -1011,35 +1041,17 @@ struct CoveMainView: View {
                     "Add a new passkey to restore access to your cloud backup. Until you do, your backups can't be restored."
                 )
             }
-            .alert(
-                startupTorUnavailable?.title ?? "Tor unavailable",
-                isPresented: Binding(
-                    get: { startupTorUnavailable != nil },
-                    set: { if !$0 { startupTorUnavailable = nil } }
-                ),
-                presenting: startupTorUnavailable
-            ) { warning in
-                if warning.mode == .orbot {
-                    Button("Open Orbot") {
-                        openOrbotFromStartupWarning()
-                    }
-                }
-
-                Button("Network Settings") {
+            .modifier(StartupTorWarningModifier(
+                warning: $startupTorUnavailable,
+                openOrbot: openOrbotFromStartupWarning,
+                openNetworkSettings: {
                     startupTorUnavailable = nil
                     app.pushRoute(.settings(.network))
-                }
-
-                Button("Use clearnet node", role: .destructive) {
+                },
+                useClearnetNode: {
                     Task { await useClearnetAfterStartupTorFailure() }
                 }
-
-                Button("Ignore", role: .cancel) {
-                    startupTorUnavailable = nil
-                }
-            } message: { warning in
-                Text(warning.message)
-            }
+            ))
             .fullScreenCover(isPresented: $showCloudBackupVerificationPrompt) {
                 CloudBackupVerificationPromptView(
                     onDismiss: dismissCloudBackupVerificationPrompt,

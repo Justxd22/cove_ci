@@ -274,13 +274,13 @@ struct SelectedWalletScreen: View {
         } catch {
             quick.torConnection = .red
             quick.torMessage = "Built-in Tor failed: \(error.localizedDescription)"
-            quick.logs = torConnectionLogs().suffix(6).map(String.init)
+            quick.logs = recentTorLogs(torConnectionLogs())
             return
         }
 
         let logs = torConnectionLogs()
         let snapshot = deriveBuiltInBootstrapSnapshot(logs)
-        quick.logs = logs.suffix(6).map(String.init)
+        quick.logs = recentTorLogs(logs)
 
         if snapshot.isReady {
             quick.torConnection = .green
@@ -356,6 +356,10 @@ struct SelectedWalletScreen: View {
         if dots.contains(.red) { return .red }
         if dots.contains(.yellow) { return .yellow }
         return .gray
+    }
+
+    private func recentTorLogs(_ logs: [String]) -> [String] {
+        Array(logs.dropFirst(max(logs.count - 6, 0)))
     }
 
     var titleContent: some View {

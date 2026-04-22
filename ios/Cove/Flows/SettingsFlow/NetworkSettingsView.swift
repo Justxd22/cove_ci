@@ -312,7 +312,7 @@ struct NetworkSettingsView: View {
     }
 
     private var orbotSection: some View {
-        Section("Orbot Integration") {
+        Section {
             HStack {
                 Label(orbotTitle, systemImage: "gearshape")
                 Spacer()
@@ -342,6 +342,8 @@ struct NetworkSettingsView: View {
                 }
                 .frame(maxWidth: .infinity)
             }
+        } header: {
+            Text("Orbot Integration")
         } footer: {
             Text("On iOS, Orbot mode is validated by checking the local SOCKS endpoint at 127.0.0.1:9050.")
         }
