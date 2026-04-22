@@ -186,18 +186,20 @@ struct NetworkSettingsView: View {
                 }
             }
 
-            Button {
-                if uiState.enabled {
-                    showModeDialog = true
+            Menu {
+                ForEach(TorMode.uiCases, id: \.self) { mode in
+                    Button(mode.title) {
+                        setTorMode(mode)
+                    }
                 }
             } label: {
                 HStack {
                     Label("Connection Mode", systemImage: "network")
                     Spacer()
                     Text(uiState.mode.shortTitle)
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
+                        .foregroundStyle(.blue)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -241,6 +243,8 @@ struct NetworkSettingsView: View {
                     Button("Test connection") {
                         Task { await runProgressiveTorTest() }
                     }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.blue)
                     .frame(maxWidth: .infinity)
                 }
                 .padding(.vertical, 4)
@@ -301,11 +305,15 @@ struct NetworkSettingsView: View {
                 Button("Save config") {
                     saveExternalConfig()
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.blue)
                 .frame(maxWidth: .infinity)
 
                 Button("Test connection") {
                     Task { await runProgressiveTorTest() }
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.blue)
                 .frame(maxWidth: .infinity)
             }
         }
@@ -331,6 +339,8 @@ struct NetworkSettingsView: View {
                 Button("Open Orbot") {
                     openOrbotBestEffort()
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.blue)
                 .frame(maxWidth: .infinity)
 
                 Button("Test connection") {
@@ -340,6 +350,8 @@ struct NetworkSettingsView: View {
                     }
                     Task { await runProgressiveTorTest() }
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.blue)
                 .frame(maxWidth: .infinity)
             }
         } header: {

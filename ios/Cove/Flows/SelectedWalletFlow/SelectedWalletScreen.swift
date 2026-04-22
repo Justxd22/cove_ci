@@ -727,7 +727,7 @@ private struct TorQuickStatusMenu: View {
 
     var body: some View {
         Menu {
-            Section("Tor Status") {
+            Section("Tor Network Status") {
                 TorQuickStatusRow(
                     title: "Tor connection",
                     detail: status.torMessage,
@@ -756,14 +756,14 @@ private struct TorQuickStatusMenu: View {
 
             Button("Network Settings", action: openNetworkSettings)
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 Image("iconTorOnion")
                     .renderingMode(.template)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 26, height: 26)
+                    .frame(width: 20, height: 20)
 
-                BlinkingTorStatusDot(dot: status.overall, size: 8)
+                BlinkingTorStatusDot(dot: status.overall, size: 10)
             }
             .adaptiveToolbarItemStyle(isPastHeader: isPastHeader)
         }
@@ -776,16 +776,26 @@ private struct TorQuickStatusRow: View {
     let dot: TorStatusDot
 
     var body: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(dot.color)
-                .frame(width: 8, height: 8)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+        HStack {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title.uppercased())
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary.opacity(0.8))
+                
                 Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            
+            Spacer()
+            
+            if dot == .green {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(dot.color)
+                    .font(.system(size: 14))
+            } else {
+                Circle()
+                    .fill(dot.color)
+                    .frame(width: 12, height: 12)
             }
         }
     }
