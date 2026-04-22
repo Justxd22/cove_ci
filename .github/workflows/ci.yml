@@ -59,7 +59,9 @@ jobs:
             deriveddata-${{ runner.os }}-
 
       - name: Build Rust iOS core
-        run: just build-ios-release
+        run: |
+          just setup
+          just build-ios-release
 
       - name: Build app for iphoneos without signing
         run: |
