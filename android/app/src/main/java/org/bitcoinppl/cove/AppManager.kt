@@ -67,6 +67,13 @@ class AppManager private constructor() : FfiReconcile {
     var selectedFiatCurrency by mutableStateOf(Database().globalConfig().selectedFiatCurrency())
         private set
 
+    // temporary node draft state used across Settings->Network->Node navigation
+    var pendingNodeUrl by mutableStateOf("")
+    var pendingNodeName by mutableStateOf("")
+    var pendingNodeTypeName by mutableStateOf("")
+    var pendingNodeAwaitingTorSetup by mutableStateOf(false)
+    var pendingNodeTorValidated by mutableStateOf(false)
+
     // prices and fees
     var prices: PriceResponse? by mutableStateOf(runCatching { rust.prices() }.getOrNull())
         private set
@@ -93,6 +100,7 @@ class AppManager private constructor() : FfiReconcile {
         Log.d(tag, "Initializing AppManager")
         rust.listenForUpdates(this)
         wallets = runCatching { Database().wallets().all() }.getOrElse { emptyList() }
+        warmupTorIfConfigured()
     }
 
     /**
@@ -650,6 +658,29 @@ class AppManager private constructor() : FfiReconcile {
     fun dispatch(action: AppAction) {
         Log.d(tag, "dispatch $action")
         rust.dispatch(action)
+    }
+
+    private fun warmupTorIfConfigured() {
+        val globalConfig = database.globalConfig()
+        if (!globalConfig.useTor()) {
+            return
+        }
+
+        val mode = globalConfig.get(GlobalConfigKey.TorMode)
+            ?: org.bitcoinppl.cove_core.TorMode.BUILT_IN.name
+        if (mode != org.bitcoinppl.cove_core.TorMode.BUILT_IN.name) {
+            Log.d(tag, "Tor enabled with mode=$mode; no built-in warmup needed")
+            return
+        }
+
+        mainScope.launch(Dispatchers.IO) {
+            runCatching { ensureBuiltInTorBootstrap() }
+                .onSuccess { endpoint ->
+                    Log.d(tag, "Built-in Tor warmup started at $endpoint")
+                }.onFailure { error ->
+                    Log.e(tag, "Failed to warm up built-in Tor on launch: ${error.message}", error)
+                }
+        }
     }
 
     companion object {

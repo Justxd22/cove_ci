@@ -365,6 +365,14 @@ run-android profile="debug":
 [private]
 alias ra := run-android
 
+# Fast Android dev loop for local x86_64 emulator only
+[group('util')]
+fast-android-x86 *args:
+    ./scripts/android-dev-x86.sh {{args}}
+
+[private]
+alias fax := fast-android-x86
+
 # Build and clean install Android (rebuilds native libs, clears Gradle cache)
 [group('util')]
 [working-directory: 'android']

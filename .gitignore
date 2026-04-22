@@ -23,7 +23,3 @@ upload_certificate.pem
 /.jjconflict-base-*
 *.o
 /ios/build
-
-
-*.keystore
-android/build.sh

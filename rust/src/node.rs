@@ -42,9 +42,12 @@ pub enum ApiType {
     serde::Deserialize,
 )]
 pub enum TorMode {
+    #[strum(serialize = "BuiltIn", serialize = "BUILT_IN")]
     #[default]
     BuiltIn,
+    #[strum(serialize = "Orbot", serialize = "ORBOT")]
     Orbot,
+    #[strum(serialize = "External", serialize = "EXTERNAL")]
     External,
 }
 

@@ -261,9 +261,7 @@ impl GlobalConfigTable {
     }
 
     pub fn use_tor(&self) -> bool {
-        self.get(GlobalConfigKey::UseTor)
-            .unwrap_or(None)
-            .unwrap_or_else(|| "false".to_string())
+        self.get(GlobalConfigKey::UseTor).unwrap_or(None).unwrap_or_else(|| "false".to_string())
             == "true"
     }
 
@@ -352,6 +350,12 @@ impl GlobalConfigTable {
     }
 
     pub(crate) fn set(&self, key: GlobalConfigKey, value: String) -> Result<()> {
+        let should_stop_built_in_tor = match key {
+            GlobalConfigKey::TorMode => !matches!(value.parse::<TorMode>(), Ok(TorMode::BuiltIn)),
+            GlobalConfigKey::UseTor => value.eq_ignore_ascii_case("false"),
+            _ => false,
+        };
+
         let write_txn =
             self.db.begin_write().map_err(|error| Error::DatabaseAccess(error.to_string()))?;
 
@@ -367,6 +371,10 @@ impl GlobalConfigTable {
         }
 
         write_txn.commit().map_err(|error| Error::DatabaseAccess(error.to_string()))?;
+
+        if should_stop_built_in_tor {
+            crate::tor_runtime::request_stop_built_in_proxy();
+        }
 
         Updater::send_update(Update::DatabaseUpdated);
 

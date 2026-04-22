@@ -18,9 +18,13 @@ use bdk_wallet::{
     },
 };
 use bitcoin::{Transaction, Txid};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
-use crate::{database::Database, node::{Node, TorMode}};
+use crate::{
+    database::Database,
+    node::{Node, TorMode},
+    tor_runtime,
+};
 
 use super::{ApiType, client_builder::NodeClientBuilder};
 
@@ -79,6 +83,9 @@ pub enum Error {
 
     #[error("failed to get transaction: {0}")]
     ElectrumGetTransaction(electrum_client::Error),
+
+    #[error("failed to resolve tor endpoint: {0}")]
+    ResolveTorEndpoint(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,6 +106,58 @@ impl Default for NodeClientOptions {
             tor_external_host: "127.0.0.1".to_string(),
             tor_external_port: 9050,
         }
+    }
+}
+
+impl NodeClientOptions {
+    pub async fn resolve_tor_endpoint(mut self) -> Result<Self, Error> {
+        info!(
+            use_tor = self.use_tor,
+            tor_mode = ?self.tor_mode,
+            tor_external_host = %self.tor_external_host,
+            tor_external_port = self.tor_external_port,
+            "resolving tor endpoint"
+        );
+
+        if !self.use_tor {
+            info!("tor disabled; skipping tor endpoint resolution");
+            return Ok(self);
+        }
+
+        match self.tor_mode {
+            TorMode::External | TorMode::Orbot => {
+                if self.tor_external_host.is_empty() {
+                    warn!("tor external host empty; defaulting to 127.0.0.1");
+                    self.tor_external_host = "127.0.0.1".to_string();
+                }
+                if self.tor_external_port == 0 {
+                    warn!("tor external port missing; defaulting to 9050");
+                    self.tor_external_port = 9050;
+                }
+                info!(
+                    tor_mode = ?self.tor_mode,
+                    tor_external_host = %self.tor_external_host,
+                    tor_external_port = self.tor_external_port,
+                    "using configured tor endpoint"
+                );
+            }
+            TorMode::BuiltIn => {
+                info!("tor mode is built-in; requesting Arti socks endpoint");
+                match tor_runtime::built_in_socks_endpoint().await {
+                    Ok(endpoint) => {
+                        self.tor_external_host = endpoint.ip().to_string();
+                        self.tor_external_port = endpoint.port();
+                        info!(%endpoint, "resolved built-in tor socks endpoint");
+                    }
+                    Err(error) => {
+                        tracing::error!("failed to initialize built-in tor runtime: {error}");
+                        return Err(Error::ResolveTorEndpoint(error.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(self)
     }
 }
 
@@ -125,6 +184,9 @@ impl NodeClient {
             tor_external_port: config.tor_external_port(),
         };
 
+        info!(node = %node.url, api_type = ?node.api_type, options = ?options, "creating node client with db-backed options");
+
+        let options = options.resolve_tor_endpoint().await?;
         Self::new_with_options(node, options).await
     }
 
@@ -134,6 +196,11 @@ impl NodeClient {
     }
 
     pub async fn new_with_options(node: &Node, options: NodeClientOptions) -> Result<Self, Error> {
+        info!(node = %node.url, api_type = ?node.api_type, options = ?options, "creating node client with explicit options");
+        let options = options.resolve_tor_endpoint().await?;
+
+        info!(node = %node.url, api_type = ?node.api_type, resolved_options = ?options, "node client options resolved");
+
         match node.api_type {
             ApiType::Esplora => {
                 let client = esplora::EsploraClient::new_from_node_and_options(node, &options)?;

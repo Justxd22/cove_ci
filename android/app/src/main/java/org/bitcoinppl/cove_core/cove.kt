@@ -1029,7 +1029,13 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_cove_checksum_func_clear_tor_connection_logs(
+    ): Short
+    external fun uniffi_cove_checksum_func_ensure_built_in_tor_bootstrap(
+    ): Short
     external fun uniffi_cove_checksum_func_set_root_data_dir(
+    ): Short
+    external fun uniffi_cove_checksum_func_tor_connection_logs(
     ): Short
     external fun uniffi_cove_checksum_func_initialize_app(
     ): Short
@@ -3269,8 +3275,14 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_cove_fn_method_walletmetadata_uniffi_trait_hash(`ptr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_cove_fn_func_clear_tor_connection_logs(uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_cove_fn_func_ensure_built_in_tor_bootstrap(
+    ): Long
     external fun uniffi_cove_fn_func_set_root_data_dir(`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_cove_fn_func_tor_connection_logs(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_cove_fn_func_initialize_app(uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_cove_fn_func_bootstrap(
@@ -3484,7 +3496,16 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_cove_checksum_func_clear_tor_connection_logs() != 25876.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cove_checksum_func_ensure_built_in_tor_bootstrap() != 8592.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cove_checksum_func_set_root_data_dir() != 56109.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cove_checksum_func_tor_connection_logs() != 59010.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cove_checksum_func_initialize_app() != 18498.toShort()) {
@@ -46682,6 +46703,48 @@ public object FfiConverterTypeTapSignerRoute : FfiConverterRustBuffer<TapSignerR
 
 
 
+
+sealed class TorBootstrapException(message: String): kotlin.Exception(message) {
+        
+        class BuiltInTor(message: String) : TorBootstrapException(message)
+        
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<TorBootstrapException> {
+        override fun lift(error_buf: RustBuffer.ByValue): TorBootstrapException = FfiConverterTypeTorBootstrapError.lift(error_buf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTorBootstrapError : FfiConverterRustBuffer<TorBootstrapException> {
+    override fun read(buf: ByteBuffer): TorBootstrapException {
+        
+            return when(buf.getInt()) {
+            1 -> TorBootstrapException.BuiltInTor(FfiConverterString.read(buf))
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+        
+    }
+
+    override fun allocationSize(value: TorBootstrapException): ULong {
+        return 4UL
+    }
+
+    override fun write(value: TorBootstrapException, buf: ByteBuffer) {
+        when(value) {
+            is TorBootstrapException.BuiltInTor -> {
+                buf.putInt(1)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
+
+
+
+
 enum class TorMode {
     
     BUILT_IN,
@@ -54021,6 +54084,30 @@ object UrExceptionExternalErrorHandler : UniffiRustCallStatusErrorHandler<UrExce
 
 
 
+ fun `clearTorConnectionLogs`()
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_cove_fn_func_clear_tor_connection_logs(
+    
+        _status)
+}
+    
+    
+
+    @Throws(TorBootstrapException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `ensureBuiltInTorBootstrap`() : kotlin.String {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_cove_fn_func_ensure_built_in_tor_bootstrap(),
+        { future, callback, continuation -> UniffiLib.ffi_cove_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_cove_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_cove_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterString.lift(it) },
+        // Error FFI converter
+        TorBootstrapException.ErrorHandler,
+    )
+    }
 
         /**
          * set root data directory before any database access
@@ -54034,6 +54121,16 @@ object UrExceptionExternalErrorHandler : UniffiRustCallStatusErrorHandler<UrExce
         FfiConverterString.lower(`path`),_status)
 }
     
+    
+ fun `torConnectionLogs`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_cove_fn_func_tor_connection_logs(
+    
+        _status)
+}
+    )
+    }
     
 
         /**

@@ -163,6 +163,7 @@ extension WeakReconciler: WalletManagerReconciler where Reconciler == WalletMana
             self.loadState = .scanning(txns)
 
         case let .availableTransactions(txns):
+            errorAlert = nil
             switch self.loadState {
             case .loading:
                 self.loadState = .scanning(txns)
@@ -177,6 +178,7 @@ extension WeakReconciler: WalletManagerReconciler where Reconciler == WalletMana
             }
 
         case let .updatedTransactions(txns):
+            errorAlert = nil
             switch self.loadState {
             case .scanning, .loading:
                 self.loadState = .scanning(txns)
@@ -185,9 +187,11 @@ extension WeakReconciler: WalletManagerReconciler where Reconciler == WalletMana
             }
 
         case let .scanComplete(txns):
+            errorAlert = nil
             self.loadState = .loaded(txns)
 
         case let .walletBalanceChanged(balance):
+            errorAlert = nil
             withAnimation { self.balance = balance }
 
         case .unsignedTransactionsChanged:

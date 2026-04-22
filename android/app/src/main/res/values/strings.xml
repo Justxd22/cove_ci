@@ -164,6 +164,8 @@
     <string name="node_error_unknown">Unknown error: %1$s</string>
     <string name="node_error_url_empty">URL cannot be empty</string>
     <string name="node_error_parse_title">Unable to parse URL</string>
+    <string name="node_tor_redirect_message">Onion node detected. Configure Tor in Network settings, then save again.</string>
+    <string name="node_saved_via_tor_notice">Node already saved through Tor validation. Edit URL or name to save changes.</string>
     <string name="content_description_back">Back</string>
     <string name="content_description_selected">Selected</string>
 
@@ -194,6 +196,11 @@
     <string name="tor_status_bootstrapping">Connecting…</string>
     <string name="tor_status_ready">Connected</string>
     <string name="tor_status_error">Connection Error</string>
+    <string name="tor_status_not_configured">Not configured</string>
+    <string name="tor_status_testing">Needs testing</string>
+    <string name="tor_status_configured">Configured</string>
+    <string name="tor_status_install_orbot">Install Orbot first</string>
+    <string name="tor_status_action_required">Action required</string>
     <string name="tor_progress_title">Bootstrap Progress</string>
     <string name="tor_current_step_prefix">Status:</string>
     <string name="tor_latest_log_prefix">Log:</string>
@@ -214,6 +221,25 @@
     <string name="tor_open_orbot_subtitle">Manage Tor via Orbot app</string>
     <string name="tor_install_orbot_title">Get Orbot</string>
     <string name="tor_install_orbot_subtitle">Install Orbot from the Play Store</string>
+    <string name="tor_action_save_config">Save config</string>
+    <string name="tor_action_test_connection">Test connection</string>
+    <string name="tor_action_use_configuration">Use this configuration</string>
+    <string name="tor_action_refresh_orbot">Refresh Orbot status</string>
+    <string name="tor_action_open_orbot">Open Orbot</string>
+    <string name="tor_action_install_orbot">Install Orbot</string>
+    <string name="tor_error_config_invalid">External proxy config is invalid</string>
+    <string name="tor_error_no_pending_node">No pending onion node found. Add one from Node settings first.</string>
+    <string name="tor_error_node_test_failed">Node test failed: %1$s</string>
+    <string name="tor_error_proxy_unavailable">Tor proxy unavailable: %1$s</string>
+    <string name="tor_success_configuration_saved">Tor proxy configuration saved</string>
+    <string name="tor_success_connection_valid">Tor connection test passed</string>
+    <string name="tor_success_node_saved">Onion node saved successfully</string>
+    <string name="tor_disable_onion_dialog_title">Disable Tor?</string>
+    <string name="tor_disable_onion_dialog_body">Your active or pending node uses an onion address. Disable Tor only if Cove first switches to a clearnet node.</string>
+    <string name="tor_disable_onion_dialog_confirm">Disable and switch node</string>
+    <string name="tor_disable_onion_dialog_cancel">Cancel</string>
+    <string name="tor_fallback_failed">Clearnet fallback failed</string>
+    <string name="tor_fallback_applied">Switched to %1$s and disabled Tor</string>
     <string name="tor_step_bootstrap">Initializing Tor runtime</string>
     <string name="tor_step_directory">Loading network directory</string>
     <string name="tor_step_circuit">Building circuit</string>

@@ -1,5 +1,5 @@
 use crate::{
-    database::{Database, wallet_data::WalletDataDb},
+    database::{Database, global_config::GlobalConfigKey, wallet_data::WalletDataDb},
     historical_price_service::HistoricalPriceService,
     manager::wallet_manager::{Error, SendFlowErrorAlert, WalletManagerError},
     mnemonic,
@@ -61,6 +61,7 @@ pub struct WalletActor {
     pub reconciler: Sender<SingleOrMany>,
     pub wallet: Wallet,
     pub node_client: Option<NodeClient>,
+    pub node_client_signature: Option<String>,
 
     pub db: WalletDataDb,
     pub state: ActorState,
@@ -166,6 +167,7 @@ impl WalletActor {
             seed,
             wallet,
             node_client: None,
+            node_client_signature: None,
             last_scan_finished: None,
             last_height_fetched: None,
             state: ActorState::Initial,
@@ -1404,18 +1406,41 @@ impl WalletActor {
         Some(())
     }
 
+    fn node_client_signature_for(node: &Node) -> String {
+        let global_config = Database::global().global_config.clone();
+        let use_tor = global_config.use_tor();
+        let tor_mode =
+            global_config.get(GlobalConfigKey::TorMode).ok().flatten().unwrap_or_default();
+        let tor_external_host = global_config
+            .get(GlobalConfigKey::TorExternalHost)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let tor_external_port = global_config.tor_external_port();
+
+        format!(
+            "node={node:?}|use_tor={use_tor}|tor_mode={tor_mode}|tor_external_host={tor_external_host}|tor_external_port={tor_external_port}"
+        )
+    }
+
     async fn node_client(&mut self) -> Result<&NodeClient, Error> {
-        let node_client = self.node_client.as_ref();
-        if node_client.is_none() {
-            let node = Database::global().global_config.selected_node();
-            let node_client = NodeClient::new(&node).await.map_err(|err| {
+        let selected_node = Database::global().global_config.selected_node();
+        let selected_signature = Self::node_client_signature_for(&selected_node);
+
+        let reuse_cached = self.node_client_signature.as_ref() == Some(&selected_signature);
+        if !reuse_cached {
+            self.node_client = None;
+            self.node_client_signature = None;
+
+            let node_client = NodeClient::new(&selected_node).await.map_err(|err| {
                 Error::NodeConnectionFailed(format!("failed to create node client: {err}"))
             })?;
 
             self.node_client = Some(node_client);
+            self.node_client_signature = Some(selected_signature);
         }
 
-        Ok(self.node_client.as_ref().expect("just checked"))
+        Ok(self.node_client.as_ref().expect("node client initialized"))
     }
 }
 

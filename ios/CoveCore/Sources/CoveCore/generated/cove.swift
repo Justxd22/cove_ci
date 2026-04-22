@@ -28499,6 +28499,81 @@ public func FfiConverterTypeTapSignerRoute_lower(_ value: TapSignerRoute) -> Rus
 
 
 
+public 
+enum TorBootstrapError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    case BuiltInTor(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension TorBootstrapError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTorBootstrapError: FfiConverterRustBuffer {
+    typealias SwiftType = TorBootstrapError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TorBootstrapError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .BuiltInTor(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TorBootstrapError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .BuiltInTor(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTorBootstrapError_lift(_ buf: RustBuffer) throws -> TorBootstrapError {
+    return try FfiConverterTypeTorBootstrapError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTorBootstrapError_lower(_ value: TorBootstrapError) -> RustBuffer {
+    return FfiConverterTypeTorBootstrapError.lower(value)
+}
+
+
 
 public enum TorMode: Equatable, Hashable {
     
@@ -35103,6 +35178,25 @@ private func uniffiForeignFutureDroppedCallback(handle: UInt64) {
 public func uniffiForeignFutureHandleCountCove() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
+public func clearTorConnectionLogs()  {try! rustCall() {
+    uniffi_cove_fn_func_clear_tor_connection_logs($0
+    )
+}
+}
+public func ensureBuiltInTorBootstrap()async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cove_fn_func_ensure_built_in_tor_bootstrap(
+                )
+            },
+            pollFunc: ffi_cove_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cove_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cove_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeTorBootstrapError_lift
+        )
+}
 /**
  * set root data directory before any database access
  * required for Android to specify app-specific storage path
@@ -35112,6 +35206,12 @@ public func setRootDataDir(path: String)throws   {try rustCallWithError(FfiConve
         FfiConverterString.lower(path),$0
     )
 }
+}
+public func torConnectionLogs() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cove_fn_func_tor_connection_logs($0
+    )
+})
 }
 /**
  * Initialize the global App instance (Updater, router, state)
@@ -35518,7 +35618,16 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_cove_checksum_func_clear_tor_connection_logs() != 25876) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cove_checksum_func_ensure_built_in_tor_bootstrap() != 8592) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cove_checksum_func_set_root_data_dir() != 56109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cove_checksum_func_tor_connection_logs() != 59010) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cove_checksum_func_initialize_app() != 18498) {

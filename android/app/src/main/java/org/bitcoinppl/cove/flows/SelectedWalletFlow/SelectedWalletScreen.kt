@@ -14,10 +14,20 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.QrCode2
@@ -49,10 +59,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -68,15 +82,58 @@ import org.bitcoinppl.cove.ui.theme.ForceLightStatusBarIcons
 import org.bitcoinppl.cove.views.AutoSizeText
 import org.bitcoinppl.cove.views.BitcoinShieldIcon
 import org.bitcoinppl.cove_core.FiatOrBtc
+import org.bitcoinppl.cove_core.GlobalConfigKey
 import org.bitcoinppl.cove_core.HotWalletRoute
 import org.bitcoinppl.cove_core.NewWalletRoute
 import org.bitcoinppl.cove_core.Route
 import org.bitcoinppl.cove_core.SettingsRoute
+import org.bitcoinppl.cove_core.TorMode
+import org.bitcoinppl.cove_core.WalletErrorAlert
 import org.bitcoinppl.cove_core.WalletManagerAction
 import org.bitcoinppl.cove_core.WalletSettingsRoute
 import org.bitcoinppl.cove_core.WalletType
+import org.bitcoinppl.cove_core.ensureBuiltInTorBootstrap
+import org.bitcoinppl.cove_core.torConnectionLogs
 import org.bitcoinppl.cove_core.types.WalletId
+import org.bitcoinppl.cove.tor.deriveBuiltInBootstrapSnapshot
+import org.bitcoinppl.cove.tor.testSocksEndpoint
 import java.util.concurrent.atomic.AtomicBoolean
+
+private enum class TorStatusDot {
+    Green,
+    Yellow,
+    Red,
+    Gray,
+}
+
+private data class TorQuickStatus(
+    val enabled: Boolean = false,
+    val overall: TorStatusDot = TorStatusDot.Gray,
+    val torConnection: TorStatusDot = TorStatusDot.Gray,
+    val nodeReachable: TorStatusDot = TorStatusDot.Gray,
+    val nodeSynced: TorStatusDot = TorStatusDot.Gray,
+    val torMessage: String = "Tor disabled",
+    val nodeMessage: String = "Node status unavailable",
+    val syncMessage: String = "Sync status unavailable",
+    val logs: List<String> = emptyList(),
+)
+
+private fun TorStatusDot.color(): Color =
+    when (this) {
+        TorStatusDot.Green -> Color(0xFF34C759)
+        TorStatusDot.Yellow -> Color(0xFFFFC107)
+        TorStatusDot.Red -> Color(0xFFFF3B30)
+        TorStatusDot.Gray -> Color(0xFF9E9E9E)
+    }
+
+private fun parseEndpointHostPort(endpoint: String): Pair<String, Int>? {
+    val host = endpoint.substringBefore(':', "")
+    val port = endpoint.substringAfter(':', "").toIntOrNull()
+    if (host.isBlank() || port == null || port <= 0) {
+        return null
+    }
+    return host to port
+}
 
 @Preview(showBackground = true, backgroundColor = 0xFF0D1B2A)
 @Composable
@@ -177,6 +234,170 @@ fun SelectedWalletScreen(
     var showRenameMenu by remember { mutableStateOf(false) }
     val isColdWallet = manager?.walletMetadata?.walletType == WalletType.COLD
     val isWatchOnly = manager?.walletMetadata?.walletType == WalletType.WATCH_ONLY
+    val globalConfig = remember(app) { app?.database?.globalConfig() }
+    var showTorStatusMenu by remember { mutableStateOf(false) }
+    var torQuickStatus by remember { mutableStateOf(TorQuickStatus()) }
+    var builtInWarmupRequested by remember { mutableStateOf(false) }
+    var builtInEndpoint by remember { mutableStateOf("127.0.0.1:39050") }
+    val torBusyBlinkTransition = rememberInfiniteTransition(label = "torBusyBlink")
+    val torBusyBlinkAlpha =
+        torBusyBlinkTransition.animateFloat(
+            initialValue = 0.35f,
+            targetValue = 1f,
+            animationSpec =
+                infiniteRepeatable(
+                    animation = tween(durationMillis = 1400, easing = LinearEasing),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+            label = "torBusyBlinkAlpha",
+        )
+    val torOverallDotAlpha =
+        if (torQuickStatus.overall == TorStatusDot.Yellow) torBusyBlinkAlpha.value else 1f
+
+    LaunchedEffect(manager, app, globalConfig) {
+        while (true) {
+            if (globalConfig == null) {
+                torQuickStatus =
+                    TorQuickStatus(
+                        overall = TorStatusDot.Gray,
+                        torConnection = TorStatusDot.Gray,
+                        nodeReachable = TorStatusDot.Gray,
+                        nodeSynced = TorStatusDot.Gray,
+                        torMessage = "Tor status unavailable",
+                        nodeMessage = "Node status unavailable",
+                        syncMessage = "Sync status unavailable",
+                    )
+                delay(2500)
+                continue
+            }
+
+            val useTor = runCatching { globalConfig.useTor() }.getOrDefault(false)
+            val modeName = runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull()
+            val torMode = runCatching { TorMode.valueOf(modeName ?: TorMode.BUILT_IN.name) }
+                .getOrDefault(TorMode.BUILT_IN)
+            val torLogs = runCatching { torConnectionLogs() }.getOrDefault(emptyList())
+            val bootstrap = deriveBuiltInBootstrapSnapshot(torLogs)
+
+            val torConnection: TorStatusDot
+            val torMessage: String
+            if (!useTor) {
+                torConnection = TorStatusDot.Red
+                torMessage = "Tor disabled"
+            } else {
+                when (torMode) {
+                    TorMode.BUILT_IN -> {
+                        if (!builtInWarmupRequested) {
+                            builtInWarmupRequested = true
+                            runCatching { ensureBuiltInTorBootstrap() }
+                                .onSuccess { endpoint -> builtInEndpoint = endpoint }
+                        }
+                        val (builtInHost, builtInPort) =
+                            parseEndpointHostPort(builtInEndpoint)
+                                ?: ("127.0.0.1" to 39050)
+                        val socksReady = testSocksEndpoint(builtInHost, builtInPort, 1200).isSuccess
+                        torConnection =
+                            when {
+                                bootstrap.isReady && socksReady -> TorStatusDot.Green
+                                bootstrap.hasError -> TorStatusDot.Red
+                                else -> TorStatusDot.Yellow
+                            }
+                        torMessage =
+                            when (torConnection) {
+                                TorStatusDot.Green -> "Built-in Tor ready"
+                                TorStatusDot.Red -> "Built-in Tor error"
+                                else -> "Built-in Tor bootstrapping (${bootstrap.percent}%)"
+                            }
+                    }
+                    TorMode.ORBOT -> {
+                        val socksReady = testSocksEndpoint("127.0.0.1", 9050, 1200).isSuccess
+                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Yellow
+                        torMessage =
+                            if (socksReady) {
+                                "Orbot SOCKS endpoint reachable"
+                            } else {
+                                "Waiting for Orbot SOCKS endpoint"
+                            }
+                    }
+                    TorMode.EXTERNAL -> {
+                        val host =
+                            runCatching { globalConfig.get(GlobalConfigKey.TorExternalHost) }
+                                .getOrNull()
+                                ?.takeIf { it.isNotBlank() }
+                                ?: "127.0.0.1"
+                        val port =
+                            runCatching { globalConfig.torExternalPort().toInt() }
+                                .getOrDefault(9050)
+                        val socksReady = testSocksEndpoint(host, port, 1200).isSuccess
+                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Yellow
+                        torMessage =
+                            if (socksReady) {
+                                "External SOCKS endpoint reachable"
+                            } else {
+                                "Waiting for external SOCKS endpoint"
+                            }
+                    }
+                }
+            }
+
+            val nodeReachable =
+                when {
+                    useTor && torConnection == TorStatusDot.Yellow -> TorStatusDot.Yellow
+                    manager == null -> TorStatusDot.Gray
+                    manager.errorAlert is WalletErrorAlert.NodeConnectionFailed -> TorStatusDot.Red
+                    manager.loadState is WalletLoadState.LOADING -> TorStatusDot.Yellow
+                    else -> TorStatusDot.Green
+                }
+            val nodeMessage =
+                when (nodeReachable) {
+                    TorStatusDot.Green -> "Node reachable"
+                    TorStatusDot.Red -> "Node connection failed"
+                    TorStatusDot.Yellow -> "Checking node connection"
+                    TorStatusDot.Gray -> "Node status unavailable"
+                }
+
+            val nodeSynced =
+                when {
+                    useTor && torConnection == TorStatusDot.Yellow -> TorStatusDot.Yellow
+                    manager?.loadState is WalletLoadState.LOADED -> TorStatusDot.Green
+                    manager?.loadState is WalletLoadState.SCANNING -> TorStatusDot.Yellow
+                    manager?.loadState == WalletLoadState.LOADING -> TorStatusDot.Yellow
+                    else -> TorStatusDot.Gray
+                }
+            val syncMessage =
+                when (nodeSynced) {
+                    TorStatusDot.Green -> "Node synced"
+                    TorStatusDot.Yellow -> "Node syncing"
+                    TorStatusDot.Red -> "Node sync failed"
+                    TorStatusDot.Gray -> "Sync status unavailable"
+                }
+
+            val overall =
+                when {
+                    listOf(torConnection, nodeReachable, nodeSynced).all { it == TorStatusDot.Green } ->
+                        TorStatusDot.Green
+                    listOf(torConnection, nodeReachable, nodeSynced).any { it == TorStatusDot.Red } ->
+                        TorStatusDot.Red
+                    listOf(torConnection, nodeReachable, nodeSynced).all { it == TorStatusDot.Gray } ->
+                        TorStatusDot.Gray
+                    else -> TorStatusDot.Yellow
+                }
+
+            torQuickStatus =
+                TorQuickStatus(
+                    enabled = useTor,
+                    overall = overall,
+                    torConnection = torConnection,
+                    nodeReachable = nodeReachable,
+                    nodeSynced = nodeSynced,
+                    torMessage = torMessage,
+                    nodeMessage = nodeMessage,
+                    syncMessage = syncMessage,
+                    logs = torLogs.takeLast(6),
+                )
+
+            delay(2500)
+        }
+    }
 
     // force white status bar icons for midnight blue background
     ForceLightStatusBarIcons()
@@ -268,7 +489,106 @@ fun SelectedWalletScreen(
                     }
                 },
                 actions = {
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (torQuickStatus.enabled) {
+                            Box {
+                                Row(
+                                    modifier =
+                                        Modifier
+                                            .padding(end = 4.dp)
+                                            .clickable { showTorStatusMenu = true }
+                                            .padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.icon_tor_onion),
+                                        contentDescription = "Tor",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Filled.FiberManualRecord,
+                                        contentDescription = "Tor status",
+                                        tint = torQuickStatus.overall.color(),
+                                        modifier =
+                                            Modifier
+                                                .size(10.dp)
+                                                .alpha(torOverallDotAlpha),
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showTorStatusMenu,
+                                    onDismissRequest = { showTorStatusMenu = false },
+                                    modifier = Modifier.background(MaterialTheme.colorScheme.surface),
+                                ) {
+                                    Column(
+                                        modifier =
+                                            Modifier
+                                                .width(280.dp)
+                                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        Text(
+                                            text = "Tor Network Status",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            TorStatusRow("Tor Connection", torQuickStatus.torConnection, torQuickStatus.torMessage)
+                                            TorStatusRow("Node Reachable", torQuickStatus.nodeReachable, torQuickStatus.nodeMessage)
+                                            TorStatusRow("Node Synced", torQuickStatus.nodeSynced, torQuickStatus.syncMessage)
+                                        }
+
+                                        if (torQuickStatus.logs.isNotEmpty()) {
+                                            Column(
+                                                modifier =
+                                                    Modifier
+                                                        .fillMaxWidth()
+                                                        .clip(RoundedCornerShape(8.dp))
+                                                        .background(CoveColor.midnightBlue.copy(alpha = 0.05f))
+                                                        .padding(8.dp),
+                                            ) {
+                                                Text(
+                                                    text = "Recent Logs",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.padding(bottom = 4.dp),
+                                                )
+                                                torQuickStatus.logs.forEach { line ->
+                                                    Text(
+                                                        text = line,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        maxLines = 1,
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Text(
+                                            text = "Network Settings",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier =
+                                                Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        showTorStatusMenu = false
+                                                        app?.pushRoute(Route.Settings(SettingsRoute.Network))
+                                                    }.padding(vertical = 4.dp),
+                                            textAlign = TextAlign.Center,
+                                        )
+                                    }
+                                }
+                            }
+                        }
                         IconButton(
                             onClick = onQrCode,
                             modifier = Modifier.size(36.dp),
@@ -572,6 +892,64 @@ private fun TransactionsLoadingView(
             CircularProgressIndicator(
                 modifier = Modifier.padding(top = 80.dp),
                 color = primaryText,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TorStatusRow(
+    title: String,
+    dot: TorStatusDot,
+    subtitle: String,
+) {
+    val blinkTransition = rememberInfiniteTransition(label = "torRowBlink")
+    val blinkAlpha =
+        blinkTransition.animateFloat(
+            initialValue = 0.35f,
+            targetValue = 1f,
+            animationSpec =
+                infiniteRepeatable(
+                    animation = tween(durationMillis = 1400, easing = LinearEasing),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+            label = "torRowBlinkAlpha",
+        )
+    val dotAlpha = if (dot == TorStatusDot.Yellow) blinkAlpha.value else 1f
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title.uppercase(),
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                letterSpacing = 0.5.sp,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        if (dot == TorStatusDot.Green) {
+            Icon(
+                imageVector = Icons.Filled.CheckCircle,
+                contentDescription = null,
+                tint = dot.color(),
+                modifier = Modifier.size(16.dp).alpha(dotAlpha),
+            )
+        } else {
+            Icon(
+                imageVector = Icons.Filled.FiberManualRecord,
+                contentDescription = null,
+                tint = dot.color(),
+                modifier = Modifier.size(14.dp).alpha(dotAlpha),
             )
         }
     }

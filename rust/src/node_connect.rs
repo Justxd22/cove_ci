@@ -1,10 +1,13 @@
-use tracing::error;
+use tracing::{error, info, warn};
 use url::Url;
 
 use crate::{
     database::{Database, global_flag::GlobalFlagKey},
     network::Network,
-    node::{ApiType, Node},
+    node::{
+        ApiType, Node,
+        client::{NodeClient, NodeClientOptions},
+    },
 };
 use cove_macros::impl_default_for;
 use eyre::{Context, eyre};
@@ -128,7 +131,9 @@ impl NodeSelector {
 
     #[uniffi::method]
     pub async fn check_selected_node(&self, node: Node) -> Result<(), Error> {
-        node.check_url().await.map_err(|error| Error::NodeAccessError(format!("{error:?}")))?;
+        check_node_with_tor_inference(&node)
+            .await
+            .map_err(|error| Error::NodeAccessError(format!("{error:?}")))?;
 
         Ok(())
     }
@@ -142,13 +147,27 @@ impl NodeSelector {
         entered_name: String,
     ) -> Result<Node, Error> {
         let node_type = name.to_ascii_lowercase();
-        let api_type = if node_type.contains("electrum") {
+        let hinted_api_type = if node_type.contains("electrum") {
             ApiType::Electrum
         } else if node_type.contains("esplora") {
             ApiType::Esplora
         } else {
             error!("invalid node type: {node_type}");
-            return Ok(Node::default(self.network));
+            return Err(Error::ParseNodeUrlError("invalid node type".to_string()));
+        };
+        let inferred_api_type = infer_api_type_from_url_hint(&url);
+        let api_type = match inferred_api_type {
+            Some(inferred) if inferred != hinted_api_type => {
+                warn!(
+                    requested_type = ?hinted_api_type,
+                    inferred_type = ?inferred,
+                    url = %url,
+                    "custom node type mismatched url; using type inferred from url",
+                );
+                inferred
+            }
+            Some(inferred) => inferred,
+            None => hinted_api_type,
         };
 
         let url = parse_node_url(&url, api_type)
@@ -178,7 +197,7 @@ impl NodeSelector {
     #[uniffi::method]
     /// Check the node url and set it as selected node if it is valid
     pub async fn check_and_save_node(&self, node: Node) -> Result<(), Error> {
-        node.check_url().await.map_err(|error| {
+        check_node_with_tor_inference(&node).await.map_err(|error| {
             tracing::warn!("error checking node: {error:?}");
             Error::NodeAccessError(error.to_string())
         })?;
@@ -266,10 +285,81 @@ fn node_implies_tor(node: &Node) -> bool {
         .is_some_and(|host| host.ends_with(".onion"))
 }
 
+async fn check_node_with_tor_inference(node: &Node) -> Result<(), crate::node::Error> {
+    let inferred_tor = node_implies_tor(node);
+    info!(node = %node.url, api_type = ?node.api_type, inferred_tor, "checking node with tor inference");
+
+    if !inferred_tor {
+        info!(node = %node.url, "node does not imply tor; checking directly");
+        return node.check_url().await;
+    }
+
+    let db = Database::global();
+    let config = db.global_config();
+    let tor_external_host = config
+        .tor_external_host()
+        .ok()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let batch_size = match node.api_type {
+        ApiType::Electrum => 10,
+        ApiType::Esplora | ApiType::Rpc => 1,
+    };
+
+    let options = NodeClientOptions {
+        batch_size,
+        use_tor: true,
+        tor_mode: config.tor_mode().unwrap_or_default(),
+        tor_external_host,
+        tor_external_port: config.tor_external_port(),
+    };
+
+    info!(node = %node.url, options = ?options, "node implies tor; building tor-enabled node client");
+
+    let options = options.resolve_tor_endpoint().await?;
+    info!(resolved_options = ?options, "resolved tor endpoint for inferred tor node check");
+
+    let client = NodeClient::new_with_options(node, options).await?;
+    info!(node = %node.url, "running node check through tor-capable client");
+    client.check_url().await?;
+
+    Ok(())
+}
+
 fn parse_node_url(url: &str, api_type: ApiType) -> eyre::Result<Url> {
     match api_type {
         ApiType::Electrum => parse_electrum_url(url),
         ApiType::Esplora | ApiType::Rpc => parse_http_url(url),
+    }
+}
+
+fn infer_api_type_from_url_hint(url: &str) -> Option<ApiType> {
+    let lowered = url.trim().to_ascii_lowercase();
+
+    if lowered.is_empty() {
+        return None;
+    }
+
+    if lowered.starts_with("tcp://") || lowered.starts_with("ssl://") {
+        return Some(ApiType::Electrum);
+    }
+
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        return Some(ApiType::Esplora);
+    }
+
+    if lowered.contains("://") {
+        return None;
+    }
+
+    if lowered.contains('/') {
+        return Some(ApiType::Esplora);
+    }
+
+    match lowered.rsplit_once(':') {
+        Some((_, "50001" | "50002")) => Some(ApiType::Electrum),
+        _ => None,
     }
 }
 
@@ -302,6 +392,13 @@ fn parse_electrum_url(url: &str) -> eyre::Result<Url> {
         _ => {}
     }
 
+    if !matches!(url.scheme(), "ssl" | "tcp") {
+        return Err(eyre!(
+            "invalid electrum url scheme `{}`; expected tcp:// or ssl://",
+            url.scheme(),
+        ));
+    }
+
     // set the port to if not set, default to 50002 for ssl and 50001 for tcp
     match (url.port(), url.scheme()) {
         (Some(_), _) => {}
@@ -319,6 +416,13 @@ fn parse_http_url(url: &str) -> eyre::Result<Url> {
     let url = if url.contains("://") { url.to_string() } else { format!("https://{url}") };
 
     let mut url = Url::parse(&url)?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(eyre!(
+            "invalid esplora url scheme `{}`; expected http:// or https://",
+            url.scheme(),
+        ));
+    }
 
     if url.port().is_none() {
         let default_port = if url.scheme() == "http" { 80 } else { 443 };

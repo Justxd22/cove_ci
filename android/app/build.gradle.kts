@@ -4,6 +4,12 @@ plugins {
     id("org.jlleitschuh.gradle.ktlint")
 }
 
+val coveAbiFilters: Set<String> = ((project.findProperty("coveAbiFilters") as String?) ?: "")
+    .split(',')
+    .map(String::trim)
+    .filter(String::isNotEmpty)
+    .toSet()
+
 android {
     namespace = "org.bitcoinppl.cove"
     compileSdk = 36
@@ -18,6 +24,11 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+        ndk {
+            if (coveAbiFilters.isNotEmpty()) {
+                abiFilters += coveAbiFilters
+            }
         }
     }
 
