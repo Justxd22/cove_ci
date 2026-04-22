@@ -12,6 +12,16 @@ list:
 xtask *args:
     cd rust && test -f target/debug/xtask || cargo build --package xtask -q && ./target/debug/xtask {{args}}
 
+# Setup repository after fresh clone
+[group('utils')]
+[script('bash')]
+setup:
+    set -euo pipefail
+    git submodule sync --recursive
+    git submodule update --init --recursive --depth 1 --recommend-shallow
+    git submodule status --recursive
+    echo "Repository setup complete."
+
 # Sign a PSBT and output all formats (base64, hex, binary, bbqr-gif, ur-gif)
 # Requires MNEMONIC env var (set in .envrc or pass directly)
 [group('utils')]
