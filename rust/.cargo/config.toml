@@ -1,10 +1,6 @@
 [alias]
 xtask = "run --package xtask --"
 
-[build]
-# Local patched BDK uses cfg(coverage_nightly); allow it so strict warning settings don't fail builds.
-rustflags = ["--check-cfg=cfg(coverage_nightly)"]
-
 [env]
 IPHONEOS_DEPLOYMENT_TARGET = "18.0"
 

@@ -1411,11 +1411,8 @@ impl WalletActor {
         let use_tor = global_config.use_tor();
         let tor_mode =
             global_config.get(GlobalConfigKey::TorMode).ok().flatten().unwrap_or_default();
-        let tor_external_host = global_config
-            .get(GlobalConfigKey::TorExternalHost)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let tor_external_host =
+            global_config.get(GlobalConfigKey::TorExternalHost).ok().flatten().unwrap_or_default();
         let tor_external_port = global_config.tor_external_port();
 
         format!(

@@ -808,13 +808,13 @@ private struct TorQuickStatusRow: View {
                 Text(title.uppercased())
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary.opacity(0.8))
-                
+
                 Text(detail)
                     .font(.system(size: 13, weight: .semibold))
             }
-            
+
             Spacer()
-            
+
             if dot == .green {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(dot.color)

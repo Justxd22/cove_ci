@@ -146,7 +146,7 @@ func validateTorExternalConfig(host: String, port: String) -> String? {
         return "Port must be a number"
     }
 
-    guard (1...65535).contains(parsed) else {
+    guard (1 ... 65535).contains(parsed) else {
         return "Port must be between 1 and 65535"
     }
 
@@ -155,7 +155,7 @@ func validateTorExternalConfig(host: String, port: String) -> String? {
 
 func parseEndpointHostPort(_ endpoint: String) -> (String, Int)? {
     let parts = endpoint.split(separator: ":", maxSplits: 1).map(String.init)
-    guard parts.count == 2, let port = Int(parts[1]), (1...65535).contains(port) else {
+    guard parts.count == 2, let port = Int(parts[1]), (1 ... 65535).contains(port) else {
         return nil
     }
 
@@ -215,7 +215,7 @@ private func firstRegexInts(_ pattern: String, in string: String) -> [Int]? {
         return nil
     }
 
-    return (1..<match.numberOfRanges).compactMap { index in
+    return (1 ..< match.numberOfRanges).compactMap { index in
         guard let valueRange = Range(match.range(at: index), in: string) else { return nil }
         return Int(string[valueRange])
     }
@@ -276,8 +276,8 @@ func deriveBuiltInBootstrapSnapshot(_ logLines: [String]) -> TorBootstrapSnapsho
         {
             percent = max(percent, 8)
             step = "Starting SOCKS proxy"
-        } else if lowered.contains("listening on")
-            && (lowered.contains("127.0.0.1:") || lowered.contains("[::1]:"))
+        } else if lowered.contains("listening on"),
+                  lowered.contains("127.0.0.1:") || lowered.contains("[::1]:")
         {
             percent = max(percent, 15)
             step = "SOCKS listener ready"
@@ -364,7 +364,7 @@ func deriveBuiltInBootstrapSnapshot(_ logLines: [String]) -> TorBootstrapSnapsho
 }
 
 func testSocksEndpoint(host: String, port: Int, timeout: TimeInterval = 3) async -> Result<Void, Error> {
-    guard (1...65535).contains(port),
+    guard (1 ... 65535).contains(port),
           let endpointPort = NWEndpoint.Port(rawValue: UInt16(port))
     else {
         return .failure(TorSupportError.invalidEndpoint)
@@ -405,7 +405,7 @@ func testSocksEndpoint(host: String, port: Int, timeout: TimeInterval = 3) async
 }
 
 func testTorApiThroughSocks(host: String, port: Int, timeout: TimeInterval = 8) async -> Result<TorApiSnapshot, Error> {
-    guard (1...65535).contains(port) else {
+    guard (1 ... 65535).contains(port) else {
         return .failure(TorSupportError.invalidEndpoint)
     }
 
@@ -450,7 +450,7 @@ private func testTorApiThroughUrlSessionSocks(
         guard let http = response as? HTTPURLResponse else {
             return .failure(TorSupportError.notHTTP)
         }
-        guard (200..<300).contains(http.statusCode) else {
+        guard (200 ..< 300).contains(http.statusCode) else {
             return .failure(TorSupportError.invalidResponse)
         }
 

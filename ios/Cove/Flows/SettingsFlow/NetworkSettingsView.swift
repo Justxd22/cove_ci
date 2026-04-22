@@ -9,7 +9,10 @@ private enum TorTestStepStatus: Equatable {
 }
 
 private struct TorTestStep: Equatable, Identifiable {
-    var id: String { key }
+    var id: String {
+        key
+    }
+
     let key: String
     var title: String
     var detail: String
@@ -584,7 +587,7 @@ struct NetworkSettingsView: View {
 
     private func refreshOrbotStatus() async {
         uiState.orbotStatus = .checking
-        let reachable = (await testSocksEndpoint(host: "127.0.0.1", port: 9050, timeout: 1.5)).isSuccess()
+        let reachable = await (testSocksEndpoint(host: "127.0.0.1", port: 9050, timeout: 1.5)).isSuccess()
         uiState.orbotStatus = reachable ? .detected : .notDetected
         appendTorLog(reachable ? "Orbot SOCKS endpoint reachable" : "Orbot SOCKS endpoint not reachable")
         await updateNonBuiltInStatus()
@@ -681,7 +684,7 @@ struct NetworkSettingsView: View {
         var timeout: TimeInterval = 8
         var lastError: Error?
 
-        for attempt in 1...maxAttempts {
+        for attempt in 1 ... maxAttempts {
             appendTorTestLog("Tor API check attempt \(attempt)/\(maxAttempts) (timeout=\(Int(timeout * 1000))ms)")
             let result = await testTorApiThroughSocks(host: host, port: port, timeout: timeout)
             if result.isSuccess() {
@@ -856,11 +859,11 @@ struct NetworkSettingsView: View {
         case .builtIn:
             readyForAutoTest = uiState.status == .ready
         case .orbot:
-            let socksReady = (await testSocksEndpoint(host: "127.0.0.1", port: 9050, timeout: 1.2)).isSuccess()
+            let socksReady = await (testSocksEndpoint(host: "127.0.0.1", port: 9050, timeout: 1.2)).isSuccess()
             readyForAutoTest = socksReady
         case .external:
             let valid = validateTorExternalConfig(host: uiState.externalHost, port: uiState.externalPort) == nil
-            let socksReady = (await testSocksEndpoint(
+            let socksReady = await (testSocksEndpoint(
                 host: uiState.externalHost,
                 port: Int(uiState.externalPort) ?? 0,
                 timeout: 1.2

@@ -25,8 +25,8 @@ setup:
         echo "Shallow submodule checkout failed, retrying with full history..."
         git submodule update --init --recursive
     fi
-    shopt -s nullglob
     for patch in "$bdk_patch_dir"/*.patch; do
+        [ -e "$patch" ] || continue
         if git -C "$bdk_submodule" apply --check "$patch"; then
             git -C "$bdk_submodule" apply "$patch"
             echo "Applied $(basename "$patch")"
@@ -37,7 +37,6 @@ setup:
             exit 1
         fi
     done
-    shopt -u nullglob
     git submodule status --recursive
     echo "Repository setup complete."
 
@@ -393,14 +392,6 @@ run-android profile="debug":
 
 [private]
 alias ra := run-android
-
-# Fast Android dev loop for local x86_64 emulator only
-[group('util')]
-fast-android-x86 *args:
-    ./scripts/android-dev-x86.sh {{args}}
-
-[private]
-alias fax := fast-android-x86
 
 # Build and clean install Android (rebuilds native libs, clears Gradle cache)
 [group('util')]

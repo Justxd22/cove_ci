@@ -45,15 +45,14 @@ struct BuiltInTorPaths {
     port_info_file: PathBuf,
 }
 
-static BUILT_IN_TOR_STATE: Lazy<Mutex<BuiltInTorState>> =
-    Lazy::new(|| {
-        Mutex::new(BuiltInTorState {
-            endpoint: None,
-            launched: false,
-            last_error: None,
-            shutdown_tx: None,
-        })
-    });
+static BUILT_IN_TOR_STATE: Lazy<Mutex<BuiltInTorState>> = Lazy::new(|| {
+    Mutex::new(BuiltInTorState {
+        endpoint: None,
+        launched: false,
+        last_error: None,
+        shutdown_tx: None,
+    })
+});
 
 fn clear_built_in_state(reason: &str) {
     let mut state = BUILT_IN_TOR_STATE.lock();
@@ -151,7 +150,10 @@ fn configure_built_in_tor_environment(paths: &BuiltInTorPaths) -> Result<(), Err
 
     for dir in [&xdg_cache_home, &xdg_data_home, &xdg_state_home] {
         std::fs::create_dir_all(dir).map_err(|error| {
-            Error::Proxy(format!("failed to create built-in tor environment dir {}: {error}", dir.display()))
+            Error::Proxy(format!(
+                "failed to create built-in tor environment dir {}: {error}",
+                dir.display()
+            ))
         })?;
     }
 
@@ -187,9 +189,9 @@ fn build_tor_client_config() -> Result<TorClientConfig, Error> {
 
     // Keep storage locations aligned with Arti's env-expanded defaults. This avoids
     // spurious "Cannot change storage.* on a running client" warnings during reloads.
-    TorClientConfigBuilder::default()
-        .build()
-        .map_err(|error| Error::Proxy(format!("failed to build built-in tor client config: {error}")))
+    TorClientConfigBuilder::default().build().map_err(|error| {
+        Error::Proxy(format!("failed to build built-in tor client config: {error}"))
+    })
 }
 
 async fn wait_for_socks_listener(endpoint: SocketAddr) -> Result<(), Error> {
@@ -277,9 +279,7 @@ async fn launch_built_in_proxy() -> Result<SocketAddr, Error> {
     configure_built_in_tor_environment(&paths)?;
 
     let mut arti_builder = ArtiConfig::builder();
-    arti_builder
-        .proxy()
-        .socks_listen(Listen::new_localhost(BUILT_IN_TOR_SOCKS_PORT));
+    arti_builder.proxy().socks_listen(Listen::new_localhost(BUILT_IN_TOR_SOCKS_PORT));
     arti_builder.storage().port_info_file(CfgPath::new_literal(&paths.port_info_file));
     arti_builder.application().watch_configuration(false);
     info!(%endpoint, "configuring Arti built-in SOCKS listener");

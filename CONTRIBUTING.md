@@ -10,11 +10,14 @@
 ## Quick Start
 
 1. Clone the repository
-2. Build the Rust library and bindings:
+2. Run setup for submodules:
+   - `just setup`
+   - This initializes `rust/external/bdk` and applies project patches from `rust/patches/bdk/`
+3. Build the Rust library and bindings:
    - iOS: `just build-ios` (simulator) or `just bidd` (device)
    - Android: `just build-android`
-3. Open in Xcode (`ios/Cove.xcodeproj`) or Android Studio (`android/`)
-4. Build and run
+4. Open in Xcode (`ios/Cove.xcodeproj`) or Android Studio (`android/`)
+5. Build and run
 
 ## Release Builds
 

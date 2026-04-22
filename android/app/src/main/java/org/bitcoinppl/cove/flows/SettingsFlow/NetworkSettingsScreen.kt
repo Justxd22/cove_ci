@@ -761,10 +761,12 @@ fun NetworkSettingsScreen(
                                 network = network,
                                 isSelected = network == selectedNetwork,
                                 onClick = {
+                                    // show confirmation dialog before changing network
                                     pendingNetworkChange = network
                                 },
                             )
 
+                            // add divider between items, but not after the last one
                             if (index < networks.size - 1) {
                                 MaterialDivider()
                             }
@@ -1242,6 +1244,7 @@ fun NetworkSettingsScreen(
         )
     }
 
+    // network change confirmation dialog
     pendingNetworkChange?.let { network ->
         AlertDialog(
             onDismissRequest = { pendingNetworkChange = null },
