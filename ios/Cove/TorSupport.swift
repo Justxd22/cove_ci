@@ -409,6 +409,11 @@ func testTorApiThroughSocks(host: String, port: Int, timeout: TimeInterval = 8) 
         return .failure(TorSupportError.invalidEndpoint)
     }
 
+    let httpsResult = await testTorApiThroughUrlSessionSocks(host: host, port: port, timeout: timeout)
+    if httpsResult.isSuccess() {
+        return httpsResult
+    }
+
     return await withCheckedContinuation { continuation in
         SocksTorApiProbe(
             host: host,
@@ -417,6 +422,56 @@ func testTorApiThroughSocks(host: String, port: Int, timeout: TimeInterval = 8) 
             continuation: continuation
         ).start()
     }
+}
+
+private func testTorApiThroughUrlSessionSocks(
+    host: String,
+    port: Int,
+    timeout: TimeInterval
+) async -> Result<TorApiSnapshot, Error> {
+    do {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        configuration.connectionProxyDictionary = [
+            "SOCKSEnable": NSNumber(value: true),
+            "SOCKSProxy": host,
+            "SOCKSPort": NSNumber(value: port),
+        ]
+
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        guard let url = URL(string: "https://check.torproject.org/api/ip") else {
+            return .failure(TorSupportError.invalidEndpoint)
+        }
+
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse else {
+            return .failure(TorSupportError.notHTTP)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            return .failure(TorSupportError.invalidResponse)
+        }
+
+        return parseTorApiJson(data)
+    } catch {
+        return .failure(error)
+    }
+}
+
+private func parseTorApiJson(_ data: Data) -> Result<TorApiSnapshot, Error> {
+    let raw = String(data: data, encoding: .utf8) ?? ""
+    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    let isTor = (json?["IsTor"] as? Bool)
+        ?? (json?["is_tor"] as? Bool)
+        ?? (raw.range(
+            of: #""istor"\s*:\s*true"#,
+            options: [.caseInsensitive, .regularExpression]
+        ) != nil)
+    let ip = json?["IP"] as? String
+
+    return .success(TorApiSnapshot(isTor: isTor, ip: ip, raw: raw))
 }
 
 private final class SocksTorApiProbe: @unchecked Sendable {
@@ -618,16 +673,6 @@ private final class SocksTorApiProbe: @unchecked Sendable {
         }
 
         let body = raw.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
-        let bodyData = Data(body.utf8)
-        let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
-        let isTor = (json?["IsTor"] as? Bool)
-            ?? (json?["is_tor"] as? Bool)
-            ?? (body.range(
-                of: #""istor"\s*:\s*true"#,
-                options: [.caseInsensitive, .regularExpression]
-            ) != nil)
-        let ip = json?["IP"] as? String
-
-        return .success(TorApiSnapshot(isTor: isTor, ip: ip, raw: body.isEmpty ? raw : body))
+        return parseTorApiJson(Data((body.isEmpty ? raw : body).utf8))
     }
 }
