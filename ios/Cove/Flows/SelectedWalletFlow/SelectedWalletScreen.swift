@@ -54,6 +54,7 @@ struct SelectedWalletScreen: View {
     /// private
     @State private var runPostRefresh = false
     @State private var torQuickStatus = TorQuickStatus()
+    @State private var showTorQuickStatus = false
 
     var metadata: WalletMetadata {
         manager.walletMetadata
@@ -394,13 +395,28 @@ struct SelectedWalletScreen: View {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
             HStack(spacing: 5) {
                 if torQuickStatus.enabled {
-                    TorQuickStatusMenu(
-                        status: torQuickStatus,
-                        isPastHeader: shouldShowNavBar,
-                        openNetworkSettings: {
-                            app.pushRoute(.settings(.network))
+                    Button(action: { showTorQuickStatus.toggle() }) {
+                        HStack(spacing: 2) {
+                            Image("iconTorOnion")
+                                .renderingMode(.template)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 26, height: 26)
+
+                            BlinkingTorStatusDot(dot: torQuickStatus.overall, size: 10)
                         }
-                    )
+                        .adaptiveToolbarItemStyle(isPastHeader: shouldShowNavBar)
+                    }
+                    .popover(isPresented: $showTorQuickStatus) {
+                        TorQuickStatusPopover(
+                            status: torQuickStatus,
+                            openNetworkSettings: {
+                                showTorQuickStatus = false
+                                app.pushRoute(.settings(.network))
+                            }
+                        )
+                        .presentationCompactAdaptation(.popover)
+                    }
                 }
 
                 Button(action: {
@@ -720,14 +736,16 @@ struct VerifyReminder: View {
     }
 }
 
-private struct TorQuickStatusMenu: View {
+private struct TorQuickStatusPopover: View {
     let status: TorQuickStatus
-    let isPastHeader: Bool
     let openNetworkSettings: () -> Void
 
     var body: some View {
-        Menu {
-            Section("Tor Network Status") {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Tor Network Status")
+                .font(.headline.weight(.bold))
+
+            VStack(spacing: 12) {
                 TorQuickStatusRow(
                     title: "Tor connection",
                     detail: status.torMessage,
@@ -746,27 +764,36 @@ private struct TorQuickStatusMenu: View {
             }
 
             if !status.logs.isEmpty {
-                Section("Recent logs") {
-                    ForEach(Array(status.logs.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(.caption2, design: .monospaced))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Recent logs")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.blue)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(status.logs.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.midnightBlue.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
             }
 
-            Button("Network Settings", action: openNetworkSettings)
-        } label: {
-            HStack(spacing: 2) {
-                Image("iconTorOnion")
-                    .renderingMode(.template)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 20, height: 20)
-
-                BlinkingTorStatusDot(dot: status.overall, size: 10)
+            Button(action: openNetworkSettings) {
+                Text("Network Settings")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.blue)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
             }
-            .adaptiveToolbarItemStyle(isPastHeader: isPastHeader)
         }
+        .padding(18)
+        .frame(width: 280)
     }
 }
 
@@ -776,8 +803,8 @@ private struct TorQuickStatusRow: View {
     let dot: TorStatusDot
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 0) {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(title.uppercased())
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary.opacity(0.8))
@@ -791,7 +818,7 @@ private struct TorQuickStatusRow: View {
             if dot == .green {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(dot.color)
-                    .font(.system(size: 14))
+                    .font(.system(size: 16))
             } else {
                 Circle()
                     .fill(dot.color)
