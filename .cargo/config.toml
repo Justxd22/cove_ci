@@ -1,3 +1,0 @@
-[build]
-# Local patched BDK uses cfg(coverage_nightly); allow it so cargo check stays clean.
-rustflags = ["--check-cfg=cfg(coverage_nightly)"]
