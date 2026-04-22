@@ -18,7 +18,21 @@ xtask *args:
 setup:
     set -euo pipefail
     git submodule sync --recursive
-    git submodule update --init --recursive --depth 1 --recommend-shallow
+    if ! git submodule update --init --recursive --depth 1 --recommend-shallow; then
+        echo "Shallow submodule checkout failed, retrying with full history..."
+        git submodule update --init --recursive
+    fi
+    for patch in rust/patches/bdk/*.patch; do
+        if git -C rust/external/bdk apply --check "$patch"; then
+            git -C rust/external/bdk apply "$patch"
+            echo "Applied $(basename "$patch")"
+        elif git -C rust/external/bdk apply --reverse --check "$patch"; then
+            echo "Already applied $(basename "$patch")"
+        else
+            echo "Failed to apply $(basename "$patch") cleanly" >&2
+            exit 1
+        fi
+    done
     git submodule status --recursive
     echo "Repository setup complete."
 
