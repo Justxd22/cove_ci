@@ -58,6 +58,7 @@ struct OnboardingWelcomeScreen: View {
 }
 
 struct OnboardingBitcoinChoiceScreen: View {
+    let errorMessage: String?
     let onNewHere: () -> Void
     let onHasBitcoin: () -> Void
 
@@ -67,6 +68,10 @@ struct OnboardingBitcoinChoiceScreen: View {
             title: "Do you already have Bitcoin?",
             subtitle: "We’ll tailor the setup based on where you’re starting from."
         ) {
+            if let errorMessage {
+                OnboardingInlineMessage(text: errorMessage)
+            }
+
             VStack(spacing: 14) {
                 OnboardingChoiceCard(
                     title: "No, I’m new here",
@@ -88,10 +93,83 @@ struct OnboardingBitcoinChoiceScreen: View {
     }
 }
 
+struct OnboardingReturningUserChoiceScreen: View {
+    let onRestoreFromCoveBackup: () -> Void
+    let onUseAnotherWallet: () -> Void
+    let onBack: () -> Void
+
+    var body: some View {
+        OnboardingPromptScreen(
+            icon: "arrow.trianglehead.branch",
+            title: "How would you like to continue?",
+            subtitle: "Restore from an existing Cove backup or connect another wallet you already use."
+        ) {
+            VStack(spacing: 14) {
+                OnboardingChoiceCard(
+                    title: "Restore from Cove backup",
+                    subtitle: "Use your passkey to restore from iCloud",
+                    systemImage: "icloud.and.arrow.down"
+                ) {
+                    onRestoreFromCoveBackup()
+                }
+
+                OnboardingChoiceCard(
+                    title: "Use another wallet",
+                    subtitle: "Import or connect a wallet from somewhere else",
+                    systemImage: "wallet.pass"
+                ) {
+                    onUseAnotherWallet()
+                }
+            }
+
+            Button("Back", action: onBack)
+                .buttonStyle(OnboardingSecondaryButtonStyle())
+        }
+    }
+}
+
+struct OnboardingRestoreUnavailableScreen: View {
+    let onContinue: () -> Void
+    let onBack: () -> Void
+
+    var body: some View {
+        OnboardingPromptScreen(
+            icon: "icloud.slash",
+            title: "No iCloud Backup Found",
+            subtitle: "We couldn't find a Cove backup in iCloud for this account. You can continue without cloud restore or go back."
+        ) {
+            Button("Continue Without Cloud Restore", action: onContinue)
+                .buttonStyle(OnboardingPrimaryButtonStyle())
+
+            Button("Back", action: onBack)
+                .buttonStyle(OnboardingSecondaryButtonStyle())
+        }
+    }
+}
+
+struct OnboardingRestoreOfflineScreen: View {
+    let onContinue: () -> Void
+    let onBack: () -> Void
+
+    var body: some View {
+        OnboardingPromptScreen(
+            icon: "wifi.slash",
+            title: "You’re Offline",
+            subtitle: "Cove can’t check for an iCloud backup right now. You can continue onboarding and check Cloud Backup later in Settings."
+        ) {
+            Button("Continue Without Cloud Restore", action: onContinue)
+                .buttonStyle(OnboardingPrimaryButtonStyle())
+
+            Button("Back", action: onBack)
+                .buttonStyle(OnboardingSecondaryButtonStyle())
+        }
+    }
+}
+
 struct OnboardingStorageChoiceScreen: View {
-    let onExchange: () -> Void
-    let onHardwareWallet: () -> Void
-    let onSoftwareWallet: () -> Void
+    let errorMessage: String?
+    let onRestoreFromCoveBackup: (() -> Void)?
+    let onSelectStorage: (OnboardingStorageSelection) -> Void
     let onBack: () -> Void
 
     var body: some View {
@@ -100,13 +178,21 @@ struct OnboardingStorageChoiceScreen: View {
             title: "How do you store your Bitcoin?",
             subtitle: "Choose the option that best matches what you use today."
         ) {
+            if let errorMessage {
+                OnboardingInlineMessage(text: errorMessage)
+            }
+
             VStack(spacing: 14) {
+                if let onRestoreFromCoveBackup {
+                    OnboardingCloudRestoreChoiceCard(action: onRestoreFromCoveBackup)
+                }
+
                 OnboardingChoiceCard(
                     title: "On an exchange",
                     subtitle: "Move funds into a wallet you control",
                     systemImage: "building.columns"
                 ) {
-                    onExchange()
+                    onSelectStorage(.exchange)
                 }
 
                 OnboardingChoiceCard(
@@ -114,7 +200,7 @@ struct OnboardingStorageChoiceScreen: View {
                     subtitle: "Import a watch-only wallet from an existing device",
                     systemImage: "shield"
                 ) {
-                    onHardwareWallet()
+                    onSelectStorage(.hardwareWallet)
                 }
 
                 OnboardingChoiceCard(
@@ -122,7 +208,7 @@ struct OnboardingStorageChoiceScreen: View {
                     subtitle: "Import recovery data from another wallet app",
                     systemImage: "iphone"
                 ) {
-                    onSoftwareWallet()
+                    onSelectStorage(.softwareWallet)
                 }
             }
 
@@ -133,8 +219,9 @@ struct OnboardingStorageChoiceScreen: View {
 }
 
 struct OnboardingSoftwareChoiceScreen: View {
-    let onCreateWallet: () -> Void
-    let onImportWallet: () -> Void
+    let errorMessage: String?
+    let onRestoreFromCoveBackup: (() -> Void)?
+    let onSelectSoftwareAction: (OnboardingSoftwareSelection) -> Void
     let onBack: () -> Void
 
     var body: some View {
@@ -143,27 +230,48 @@ struct OnboardingSoftwareChoiceScreen: View {
             title: "What would you like to do?",
             subtitle: "Create a new wallet in Cove or import the one you already use."
         ) {
+            if let errorMessage {
+                OnboardingInlineMessage(text: errorMessage)
+            }
+
             VStack(spacing: 14) {
+                if let onRestoreFromCoveBackup {
+                    OnboardingCloudRestoreChoiceCard(action: onRestoreFromCoveBackup)
+                }
+
                 OnboardingChoiceCard(
                     title: "Create a new wallet",
                     subtitle: "Generate a fresh 12-word recovery phrase",
                     systemImage: "plus.circle"
                 ) {
-                    onCreateWallet()
+                    onSelectSoftwareAction(.createNewWallet)
                 }
 
                 OnboardingChoiceCard(
                     title: "Import existing wallet",
-                    subtitle: "Use words, QR, or a Cove backup file",
+                    subtitle: "Use words or QR from another wallet",
                     systemImage: "square.and.arrow.down"
                 ) {
-                    onImportWallet()
+                    onSelectSoftwareAction(.importExistingWallet)
                 }
             }
 
             Button("Back", action: onBack)
                 .buttonStyle(OnboardingSecondaryButtonStyle())
         }
+    }
+}
+
+struct OnboardingCloudRestoreChoiceCard: View {
+    let action: () -> Void
+
+    var body: some View {
+        OnboardingChoiceCard(
+            title: "Restore from Cove backup",
+            subtitle: "Use your passkey to restore from iCloud",
+            systemImage: "icloud.and.arrow.down",
+            action: action
+        )
     }
 }
 
@@ -348,4 +456,8 @@ struct OnboardingInlineMessage: View {
 
 #Preview("Cloud Check") {
     CloudCheckContent()
+}
+
+#Preview("Restore Offline") {
+    OnboardingRestoreOfflineScreen(onContinue: {}, onBack: {})
 }

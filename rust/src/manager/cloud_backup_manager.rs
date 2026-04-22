@@ -1,6 +1,7 @@
 mod cloud_inventory;
 mod ops;
 mod pending;
+mod prompt;
 pub(crate) mod runtime_actor;
 mod verify;
 mod wallets;
@@ -9,13 +10,14 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use act_zero::{Addr, call, send};
+use act_zero::{Addr, send};
 use cove_cspp::CsppStore as _;
 use cove_cspp::backup_data::{MASTER_KEY_RECORD_ID, wallet_record_id};
-use cove_device::cloud_storage::CloudStorage;
+use cove_device::cloud_storage::{CloudStorage, CloudSyncHealth};
 use cove_tokio::task::spawn_actor;
 use cove_util::ResultExt as _;
 use flume::{Receiver, Sender};
+use futures::stream::{self, StreamExt as _};
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
@@ -36,6 +38,7 @@ use crate::wallet::metadata::{
 };
 
 use self::cloud_inventory::RemoteWalletTruth;
+use self::prompt::CloudBackupPromptState;
 use self::runtime_actor::{CloudBackupOperation, CloudBackupRuntimeActor, RestoreOperation};
 use self::wallets::wallet_metadata_change_requires_upload;
 use self::wallets::{
@@ -44,10 +47,12 @@ use self::wallets::{
 use super::cloud_backup_detail_manager::{
     CloudOnlyOperation, CloudOnlyState, RecoveryState, SyncState, VerificationState,
 };
+use super::connectivity_manager::CONNECTIVITY_MANAGER;
 
 type LocalWalletSecret = crate::backup::model::WalletSecret;
 
 const PASSKEY_RP_ID: &str = "covebitcoinwallet.com";
+pub(super) const CLOUD_BACKUP_IO_CONCURRENCY: usize = 4;
 type Message = CloudBackupReconcileMessage;
 
 pub static CLOUD_BACKUP_MANAGER: LazyLock<Arc<RustCloudBackupManager>> =
@@ -64,12 +69,29 @@ pub enum CloudBackupStatus {
     Error(String),
 }
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq, uniffi::Enum)]
+pub enum CloudBackupPasskeyChoiceFlow {
+    Enable,
+    RepairPasskey,
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq, uniffi::Enum)]
+pub enum CloudBackupPromptIntent {
+    None,
+    ExistingBackupFound,
+    PasskeyChoice(CloudBackupPasskeyChoiceFlow),
+    MissingPasskeyReminder,
+    VerificationPrompt,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum CloudBackupManagerAction {
     EnableCloudBackup,
     EnableCloudBackupForceNew,
     EnableCloudBackupNoDiscovery,
     DiscardPendingEnableCloudBackup,
+    DismissPasskeyChoicePrompt,
+    DismissMissingPasskeyReminder,
     RestoreFromCloudBackup,
     CancelRestore,
     StartVerification,
@@ -88,22 +110,22 @@ pub enum CloudBackupManagerAction {
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum CloudBackupReconcileMessage {
-    StatusChanged(CloudBackupStatus),
-    ProgressChanged(Option<CloudBackupProgress>),
-    RestoreProgressChanged(Option<CloudBackupRestoreProgress>),
-    RestoreReportChanged(Option<CloudBackupRestoreReport>),
-    SyncErrorChanged(Option<String>),
-    VerificationPromptChanged(bool),
-    VerificationMetadataChanged(CloudBackupVerificationMetadata),
-    PendingUploadVerificationChanged(bool),
-    DetailChanged(Option<CloudBackupDetail>),
-    VerificationChanged(VerificationState),
-    SyncChanged(SyncState),
-    RecoveryChanged(RecoveryState),
-    CloudOnlyChanged(CloudOnlyState),
-    CloudOnlyOperationChanged(CloudOnlyOperation),
-    ExistingBackupFound,
-    PasskeyDiscoveryCancelled,
+    Status(CloudBackupStatus),
+    SyncHealth(CloudSyncHealth),
+    Progress(Option<CloudBackupProgress>),
+    RestoreProgress(Option<CloudBackupRestoreProgress>),
+    RestoreReport(Option<CloudBackupRestoreReport>),
+    SyncError(Option<String>),
+    VerificationPrompt(bool),
+    VerificationMetadata(CloudBackupVerificationMetadata),
+    PendingUploadVerification(bool),
+    Detail(Option<CloudBackupDetail>),
+    Verification(VerificationState),
+    Sync(SyncState),
+    Recovery(RecoveryState),
+    CloudOnly(CloudOnlyState),
+    CloudOnlyOperation(CloudOnlyOperation),
+    PromptIntent(CloudBackupPromptIntent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -233,6 +255,8 @@ pub enum VerificationFailureKind {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CloudBackupState {
     pub status: CloudBackupStatus,
+    pub sync_health: CloudSyncHealth,
+    pub prompt_intent: CloudBackupPromptIntent,
     pub progress: Option<CloudBackupProgress>,
     pub restore_progress: Option<CloudBackupRestoreProgress>,
     pub restore_report: Option<CloudBackupRestoreReport>,
@@ -252,6 +276,8 @@ impl Default for CloudBackupState {
     fn default() -> Self {
         Self {
             status: CloudBackupStatus::Disabled,
+            sync_health: CloudSyncHealth::Unknown,
+            prompt_intent: CloudBackupPromptIntent::None,
             progress: None,
             restore_progress: None,
             restore_report: None,
@@ -269,7 +295,37 @@ impl Default for CloudBackupState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloudStorageIssue {
+    Offline,
+    Unavailable,
+    NotFound,
+    QuotaExceeded,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingCloudStep {
+    Enable,
+    Restore,
+    Verify,
+    Sync,
+    FetchCloudOnly,
+    RestoreCloudWallet,
+    DeleteCloudWallet,
+    RecreateManifest,
+    RepairPasskey,
+    DetailRefresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingEnableSessionKind {
+    AwaitingForceNewConfirmation,
+    RetryUpload,
+}
+
 pub(crate) struct PendingEnableSession {
+    kind: PendingEnableSessionKind,
     master_key: Zeroizing<cove_cspp::master_key::MasterKey>,
     passkey: Zeroizing<UnpersistedPrfKey>,
 }
@@ -294,14 +350,41 @@ impl std::fmt::Debug for PendingEnableSession {
 }
 
 impl PendingEnableSession {
+    #[cfg(test)]
     fn new(master_key: cove_cspp::master_key::MasterKey, passkey: UnpersistedPrfKey) -> Self {
-        Self { master_key: Zeroizing::new(master_key), passkey: Zeroizing::new(passkey) }
+        Self::awaiting_confirmation(master_key, passkey)
+    }
+
+    fn awaiting_confirmation(
+        master_key: cove_cspp::master_key::MasterKey,
+        passkey: UnpersistedPrfKey,
+    ) -> Self {
+        Self {
+            kind: PendingEnableSessionKind::AwaitingForceNewConfirmation,
+            master_key: Zeroizing::new(master_key),
+            passkey: Zeroizing::new(passkey),
+        }
+    }
+
+    fn retry_upload(
+        master_key: cove_cspp::master_key::MasterKey,
+        passkey: UnpersistedPrfKey,
+    ) -> Self {
+        Self {
+            kind: PendingEnableSessionKind::RetryUpload,
+            master_key: Zeroizing::new(master_key),
+            passkey: Zeroizing::new(passkey),
+        }
     }
 
     fn into_parts(
         self,
     ) -> (Zeroizing<cove_cspp::master_key::MasterKey>, Zeroizing<UnpersistedPrfKey>) {
         (self.master_key, self.passkey)
+    }
+
+    fn is_retry_upload(&self) -> bool {
+        matches!(self.kind, PendingEnableSessionKind::RetryUpload)
     }
 }
 
@@ -440,6 +523,12 @@ pub(crate) enum CloudBackupError {
     #[error("cloud storage error: {0}")]
     Cloud(String),
 
+    #[error("offline: {0}")]
+    Offline(String),
+
+    #[error("deferred until connected: {0}")]
+    Deferred(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -470,11 +559,13 @@ pub struct RustCloudBackupManager {
     pub state: Arc<RwLock<CloudBackupState>>,
     pub reconciler: Sender<Message>,
     pub reconcile_receiver: Arc<Receiver<Message>>,
+    prompt_state: Arc<parking_lot::Mutex<CloudBackupPromptState>>,
+    pending_enable_session: Arc<parking_lot::Mutex<Option<PendingEnableSession>>>,
     pub(crate) runtime: Addr<CloudBackupRuntimeActor>,
 }
 
 impl RustCloudBackupManager {
-    fn load_persisted_state() -> PersistedCloudBackupState {
+    pub(crate) fn load_persisted_state() -> PersistedCloudBackupState {
         Database::global().cloud_backup_state.get().unwrap_or_else(|error| {
             error!("Failed to load cloud backup state: {error}");
             PersistedCloudBackupState::default()
@@ -500,18 +591,152 @@ impl RustCloudBackupManager {
         }
     }
 
+    pub(crate) fn cloud_storage_issue(
+        error: &cove_device::cloud_storage::CloudStorageError,
+    ) -> CloudStorageIssue {
+        use cove_device::cloud_storage::CloudStorageError;
+
+        match error {
+            CloudStorageError::Offline(_) => CloudStorageIssue::Offline,
+            CloudStorageError::NotAvailable(_) => CloudStorageIssue::Unavailable,
+            CloudStorageError::NotFound(_) => CloudStorageIssue::NotFound,
+            CloudStorageError::QuotaExceeded => CloudStorageIssue::QuotaExceeded,
+            CloudStorageError::UploadFailed(message)
+            | CloudStorageError::DownloadFailed(message) => {
+                Self::cloud_storage_issue_from_message(message)
+            }
+        }
+    }
+
+    pub(crate) fn cloud_storage_issue_from_message(message: &str) -> CloudStorageIssue {
+        let normalized = message.to_ascii_lowercase();
+
+        if normalized.contains("offline")
+            || normalized.contains("network")
+            || normalized.contains("timed out")
+        {
+            return CloudStorageIssue::Offline;
+        }
+
+        if normalized.contains("not available")
+            || normalized.contains("ubiquity")
+            || normalized.contains("icloud drive is not available")
+        {
+            return CloudStorageIssue::Unavailable;
+        }
+
+        if normalized.contains("quota exceeded") {
+            return CloudStorageIssue::QuotaExceeded;
+        }
+
+        if normalized.contains("not found") {
+            return CloudStorageIssue::NotFound;
+        }
+
+        CloudStorageIssue::Other
+    }
+
+    pub(crate) fn cloud_backup_issue(&self, error: &CloudBackupError) -> CloudStorageIssue {
+        match error {
+            CloudBackupError::Offline(_) | CloudBackupError::Deferred(_) => {
+                CloudStorageIssue::Offline
+            }
+            CloudBackupError::Cloud(message) => {
+                match Self::cloud_storage_issue_from_message(message) {
+                    CloudStorageIssue::Unavailable => CloudStorageIssue::Offline,
+                    issue => issue,
+                }
+            }
+            CloudBackupError::NotSupported(_)
+            | CloudBackupError::UnsupportedPasskeyProvider
+            | CloudBackupError::RecoveryRequired(_)
+            | CloudBackupError::Passkey(_)
+            | CloudBackupError::Crypto(_)
+            | CloudBackupError::Internal(_)
+            | CloudBackupError::PasskeyMismatch
+            | CloudBackupError::PasskeyDiscoveryCancelled
+            | CloudBackupError::Cancelled => CloudStorageIssue::Other,
+        }
+    }
+
+    pub(crate) fn is_connectivity_related_issue(issue: CloudStorageIssue) -> bool {
+        matches!(issue, CloudStorageIssue::Offline | CloudStorageIssue::Unavailable)
+    }
+
+    pub(crate) fn is_offline(&self) -> bool {
+        !CONNECTIVITY_MANAGER.is_connected()
+    }
+
+    fn offline_message_for_step(step: BlockingCloudStep) -> &'static str {
+        use BlockingCloudStep as B;
+        match step {
+            B::Enable => "Reconnect to the internet, then try enabling cloud backup again",
+            B::Restore => "Reconnect to the internet, then try restoring from cloud backup again",
+            B::Verify => "Reconnect to the internet, then try verifying cloud backup again",
+            B::Sync => "Reconnect to the internet, then try syncing cloud backup again",
+            B::FetchCloudOnly => {
+                "Reconnect to the internet, then try loading cloud-only wallets again"
+            }
+            B::RestoreCloudWallet => {
+                "Reconnect to the internet, then try restoring this cloud wallet again"
+            }
+            B::DeleteCloudWallet => {
+                "Reconnect to the internet, then try deleting this cloud wallet again"
+            }
+            B::RecreateManifest => {
+                "Reconnect to the internet, then try recreating the cloud backup manifest again"
+            }
+            B::RepairPasskey => "Reconnect to the internet, then try repairing cloud backup again",
+            B::DetailRefresh => {
+                "Reconnect to the internet, then try refreshing cloud backup details again"
+            }
+        }
+    }
+
+    pub(crate) fn offline_error_for_step(&self, step: BlockingCloudStep) -> CloudBackupError {
+        CloudBackupError::Offline(Self::offline_message_for_step(step).into())
+    }
+
+    pub(crate) fn ensure_cloud_connectivity(
+        &self,
+        step: BlockingCloudStep,
+    ) -> Result<(), CloudBackupError> {
+        if self.is_offline() {
+            return Err(self.offline_error_for_step(step));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn blocking_cloud_error(
+        &self,
+        step: BlockingCloudStep,
+        error: CloudBackupError,
+    ) -> CloudBackupError {
+        if Self::is_connectivity_related_issue(self.cloud_backup_issue(&error)) {
+            return self.offline_error_for_step(step);
+        }
+
+        error
+    }
+
     fn init() -> Arc<Self> {
         #[cfg(test)]
         ensure_cloud_backup_test_tokio_runtime();
 
         let (sender, receiver) = flume::bounded(1000);
 
-        Arc::new_cyclic(|manager| Self {
+        let manager = Arc::new_cyclic(|manager| Self {
             state: Arc::new(RwLock::new(CloudBackupState::default())),
             reconciler: sender,
             reconcile_receiver: Arc::new(receiver),
+            prompt_state: Arc::new(parking_lot::Mutex::new(CloudBackupPromptState::default())),
+            pending_enable_session: Arc::new(parking_lot::Mutex::new(None)),
             runtime: spawn_actor(CloudBackupRuntimeActor::new(manager.clone())),
-        })
+        });
+
+        manager.start_connectivity_listener();
+        manager
     }
 
     fn verification_metadata_for(
@@ -563,39 +788,131 @@ impl RustCloudBackupManager {
         self.send(notify(value));
     }
 
-    pub(super) fn set_status(&self, status: CloudBackupStatus) {
-        self.set_and_notify_field(status, |state| &mut state.status, Message::StatusChanged);
+    pub(crate) fn set_status(&self, status: CloudBackupStatus) {
+        let status_changed = {
+            let mut state = self.state.write();
+            if state.status == status {
+                false
+            } else {
+                state.status = status.clone();
+                true
+            }
+        };
+
+        if !status_changed {
+            return;
+        }
+
+        self.prompt_state.lock().clear_missing_passkey_dismissal();
+
+        self.send(Message::Status(status));
+        self.refresh_prompt_intent();
     }
 
-    pub(super) fn set_progress(&self, progress: Option<CloudBackupProgress>) {
-        self.set_and_notify_field(progress, |state| &mut state.progress, Message::ProgressChanged);
+    fn start_connectivity_listener(self: &Arc<Self>) {
+        // use a weak reference so the listener thread exits when the manager is dropped
+        let manager = Arc::downgrade(self);
+        let receiver = CONNECTIVITY_MANAGER.subscribe();
+
+        std::thread::spawn(move || {
+            while receiver.recv().is_ok() {
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+
+                let connected = CONNECTIVITY_MANAGER.connected();
+                manager.handle_connectivity_change(connected);
+            }
+        });
     }
 
-    pub(super) fn set_restore_progress(&self, progress: Option<CloudBackupRestoreProgress>) {
+    pub(crate) fn handle_connectivity_change(&self, connected: bool) {
+        if !connected {
+            return;
+        }
+
+        self.clear_sync_error_if_no_failed_wallet_uploads();
+        send!(self.runtime.resume_wallet_uploads_from_persisted_state());
+        send!(self.runtime.wake_pending_upload_verifier());
+        self.start_pending_upload_verification_loop();
+    }
+
+    pub(crate) fn set_sync_health(&self, sync_health: CloudSyncHealth) {
+        self.set_and_notify_field(sync_health, |state| &mut state.sync_health, Message::SyncHealth);
+    }
+
+    pub(crate) fn set_prompt_intent(&self, prompt_intent: CloudBackupPromptIntent) {
+        self.set_and_notify_field(
+            prompt_intent,
+            |state| &mut state.prompt_intent,
+            Message::PromptIntent,
+        );
+    }
+
+    pub(crate) fn refresh_prompt_intent(&self) {
+        let prompt_intent = {
+            let prompt_state = self.prompt_state.lock().clone();
+            let state = self.state.read().clone();
+            prompt_state.resolve(&state)
+        };
+
+        self.set_prompt_intent(prompt_intent);
+    }
+
+    pub(crate) fn set_existing_backup_found_prompt(&self) {
+        self.prompt_state.lock().set_existing_backup_found();
+        self.refresh_prompt_intent();
+    }
+
+    pub(crate) fn clear_existing_backup_found_prompt(&self) {
+        self.prompt_state.lock().clear_existing_backup_found();
+        self.refresh_prompt_intent();
+    }
+
+    pub(crate) fn set_passkey_choice_prompt(&self, flow: CloudBackupPasskeyChoiceFlow) {
+        self.prompt_state.lock().set_passkey_choice(flow);
+        self.refresh_prompt_intent();
+    }
+
+    pub(crate) fn clear_passkey_choice_prompt(&self) {
+        self.prompt_state.lock().clear_passkey_choice();
+        self.refresh_prompt_intent();
+    }
+
+    pub(crate) fn dismiss_missing_passkey_prompt(&self) {
+        self.prompt_state.lock().dismiss_missing_passkey();
+        self.refresh_prompt_intent();
+    }
+
+    pub(crate) fn set_progress(&self, progress: Option<CloudBackupProgress>) {
+        self.set_and_notify_field(progress, |state| &mut state.progress, Message::Progress);
+    }
+
+    pub(crate) fn set_restore_progress(&self, progress: Option<CloudBackupRestoreProgress>) {
         self.set_and_notify_field(
             progress,
             |state| &mut state.restore_progress,
-            Message::RestoreProgressChanged,
+            Message::RestoreProgress,
         );
     }
 
-    pub(super) fn set_restore_report(&self, report: Option<CloudBackupRestoreReport>) {
+    pub(crate) fn set_restore_report(&self, report: Option<CloudBackupRestoreReport>) {
         self.set_and_notify_field(
             report,
             |state| &mut state.restore_report,
-            Message::RestoreReportChanged,
+            Message::RestoreReport,
         );
     }
 
-    pub(super) fn set_sync_error(&self, sync_error: Option<String>) {
-        self.set_and_notify_field(
-            sync_error,
-            |state| &mut state.sync_error,
-            Message::SyncErrorChanged,
-        );
+    pub(crate) fn set_sync_error(&self, sync_error: Option<String>) {
+        self.set_and_notify_field(sync_error, |state| &mut state.sync_error, Message::SyncError);
     }
 
-    pub(super) fn refresh_persisted_flags(&self) {
+    pub(crate) fn refresh_sync_health(&self) {
+        send!(self.runtime.request_sync_health_refresh());
+    }
+
+    pub(crate) fn refresh_persisted_flags(&self) {
         let (verification_metadata, should_prompt_verification) = Self::load_persisted_flags();
 
         let (metadata_changed, prompt_changed) = {
@@ -615,55 +932,56 @@ impl RustCloudBackupManager {
         };
 
         if metadata_changed {
-            self.send(Message::VerificationMetadataChanged(verification_metadata));
+            self.send(Message::VerificationMetadata(verification_metadata));
         }
 
         if prompt_changed {
-            self.send(Message::VerificationPromptChanged(should_prompt_verification));
+            self.send(Message::VerificationPrompt(should_prompt_verification));
         }
+
+        self.refresh_prompt_intent();
     }
 
-    pub(super) fn set_pending_upload_verification(&self, pending: bool) {
+    pub(crate) fn set_pending_upload_verification(&self, pending: bool) {
         self.set_and_notify_field(
             pending,
             |state| &mut state.has_pending_upload_verification,
-            Message::PendingUploadVerificationChanged,
+            Message::PendingUploadVerification,
         );
+        self.refresh_prompt_intent();
     }
 
-    pub(super) fn set_detail(&self, detail: Option<CloudBackupDetail>) {
-        self.set_and_notify_field(detail, |state| &mut state.detail, Message::DetailChanged);
+    pub(crate) fn set_detail(&self, detail: Option<CloudBackupDetail>) {
+        self.set_and_notify_field(detail, |state| &mut state.detail, Message::Detail);
     }
 
-    pub(super) fn set_verification(&self, verification: VerificationState) {
+    pub(crate) fn set_verification(&self, verification: VerificationState) {
         self.set_and_notify_field(
             verification,
             |state| &mut state.verification,
-            Message::VerificationChanged,
+            Message::Verification,
         );
+        self.refresh_prompt_intent();
     }
 
-    pub(super) fn set_sync(&self, sync: SyncState) {
-        self.set_and_notify_field(sync, |state| &mut state.sync, Message::SyncChanged);
+    pub(crate) fn set_sync(&self, sync: SyncState) {
+        self.set_and_notify_field(sync, |state| &mut state.sync, Message::Sync);
     }
 
-    pub(super) fn set_recovery(&self, recovery: RecoveryState) {
-        self.set_and_notify_field(recovery, |state| &mut state.recovery, Message::RecoveryChanged);
+    pub(crate) fn set_recovery(&self, recovery: RecoveryState) {
+        self.set_and_notify_field(recovery, |state| &mut state.recovery, Message::Recovery);
+        self.refresh_prompt_intent();
     }
 
-    pub(super) fn set_cloud_only(&self, cloud_only: CloudOnlyState) {
-        self.set_and_notify_field(
-            cloud_only,
-            |state| &mut state.cloud_only,
-            Message::CloudOnlyChanged,
-        );
+    pub(crate) fn set_cloud_only(&self, cloud_only: CloudOnlyState) {
+        self.set_and_notify_field(cloud_only, |state| &mut state.cloud_only, Message::CloudOnly);
     }
 
-    pub(super) fn set_cloud_only_operation(&self, cloud_only_operation: CloudOnlyOperation) {
+    pub(crate) fn set_cloud_only_operation(&self, cloud_only_operation: CloudOnlyOperation) {
         self.set_and_notify_field(
             cloud_only_operation,
             |state| &mut state.cloud_only_operation,
-            Message::CloudOnlyOperationChanged,
+            Message::CloudOnlyOperation,
         );
     }
 
@@ -731,7 +1049,7 @@ impl RustCloudBackupManager {
         operation.run(|| self.set_restore_report(report)).map(|_| ())
     }
 
-    pub(crate) fn build_cloud_backup_detail_with_remote_truth(
+    pub(crate) async fn build_cloud_backup_detail_with_remote_truth(
         &self,
         wallet_record_ids: &[String],
         remote_wallet_truth: RemoteWalletTruth,
@@ -739,7 +1057,8 @@ impl RustCloudBackupManager {
         Ok(self::cloud_inventory::CloudWalletInventory::load_with_remote_truth(
             wallet_record_ids,
             remote_wallet_truth,
-        )?
+        )
+        .await?
         .build_detail())
     }
 
@@ -784,6 +1103,10 @@ impl RustCloudBackupManager {
 
         if let Err(error) = Database::global().cloud_blob_sync_states.set(&sync_state) {
             error!("Failed to persist dirty cloud backup state: {error}");
+            return;
+        }
+
+        if self.is_offline() {
             return;
         }
 
@@ -837,25 +1160,28 @@ impl RustCloudBackupManager {
     }
 
     pub(crate) fn replace_pending_enable_session(&self, session: PendingEnableSession) {
-        cove_tokio::task::block_on(call!(self.runtime.replace_pending_enable_session(session)))
-            .unwrap_or_else(|error| {
-                error!("Failed to cache pending enable session: {error}");
-            });
+        *self.pending_enable_session.lock() = Some(session);
+    }
+
+    pub(crate) fn take_retry_pending_enable_session(&self) -> Option<PendingEnableSession> {
+        let pending = self.take_pending_enable_session();
+        if pending.as_ref().is_some_and(PendingEnableSession::is_retry_upload) {
+            return pending;
+        }
+
+        if let Some(pending) = pending {
+            self.replace_pending_enable_session(pending);
+        }
+
+        None
     }
 
     pub(crate) fn take_pending_enable_session(&self) -> Option<PendingEnableSession> {
-        cove_tokio::task::block_on(call!(self.runtime.take_pending_enable_session()))
-            .unwrap_or_else(|error| {
-                error!("Failed to take pending enable session: {error}");
-                None
-            })
+        self.pending_enable_session.lock().take()
     }
 
     pub(crate) fn clear_pending_enable_session(&self) {
-        cove_tokio::task::block_on(call!(self.runtime.clear_pending_enable_session()))
-            .unwrap_or_else(|error| {
-                error!("Failed to clear pending enable session: {error}");
-            });
+        self.pending_enable_session.lock().take();
     }
 
     pub(crate) fn replace_pending_verification_completion(
@@ -900,7 +1226,7 @@ impl RustCloudBackupManager {
         send!(self.runtime.clear_pending_verification_completion());
     }
 
-    fn load_remote_wallet_truth(
+    async fn load_remote_wallet_truth(
         &self,
         wallet_record_ids: &[String],
     ) -> Result<RemoteWalletTruth, CloudBackupError> {
@@ -918,18 +1244,27 @@ impl RustCloudBackupManager {
             });
         };
 
-        let cloud = CloudStorage::global();
-        let reader = WalletBackupReader::new(
-            cloud.clone(),
-            namespace.clone(),
-            Zeroizing::new(master_key.critical_data_key()),
-        );
+        let cloud = CloudStorage::global().clone();
+        let critical_key = master_key.critical_data_key();
         let mut remote_wallet_truth = RemoteWalletTruth::default();
 
-        for wallet in local_wallets {
-            let record_id = wallet_record_id(wallet.id.as_ref());
+        let mut summaries = stream::iter(local_wallets)
+            .map(|wallet| {
+                let cloud = cloud.clone();
+                let namespace = namespace.clone();
 
-            match reader.summary(&record_id) {
+                async move {
+                    let record_id = wallet_record_id(wallet.id.as_ref());
+                    let reader =
+                        WalletBackupReader::new(cloud, namespace, Zeroizing::new(critical_key));
+                    let result = reader.summary(&record_id).await;
+                    (record_id, result)
+                }
+            })
+            .buffer_unordered(CLOUD_BACKUP_IO_CONCURRENCY);
+
+        while let Some((record_id, result)) = summaries.next().await {
+            match result {
                 Ok(WalletBackupLookup::Found(summary)) => {
                     remote_wallet_truth.summaries_by_record_id.insert(record_id, summary);
                 }
@@ -986,16 +1321,16 @@ impl RustCloudBackupManager {
             };
 
             if progress_changed {
-                self.send(Message::ProgressChanged(None));
+                self.send(Message::Progress(None));
             }
             if restore_progress_changed {
-                self.send(Message::RestoreProgressChanged(None));
+                self.send(Message::RestoreProgress(None));
             }
             if restore_report_changed {
-                self.send(Message::RestoreReportChanged(None));
+                self.send(Message::RestoreReport(None));
             }
             if status_changed {
-                self.send(Message::StatusChanged(status));
+                self.send(Message::Status(status));
             }
         } else {
             let status = self.state.read().status.clone();
@@ -1005,6 +1340,7 @@ impl RustCloudBackupManager {
             }
         }
 
+        self.refresh_prompt_intent();
         true
     }
 
@@ -1037,11 +1373,13 @@ impl RustCloudBackupManager {
     }
 
     pub fn state(&self) -> CloudBackupState {
+        let db_state = Self::load_persisted_state();
         let mut state = self.state.read().clone();
-        let (verification_metadata, should_prompt_verification) = Self::load_persisted_flags();
-        state.verification_metadata = verification_metadata;
-        state.should_prompt_verification = should_prompt_verification;
+        state.status = Self::runtime_status_for(&db_state);
+        state.verification_metadata = Self::verification_metadata_for(&db_state);
+        state.should_prompt_verification = db_state.should_prompt_verification();
         state.has_pending_upload_verification = self.has_pending_cloud_upload_verification();
+        state.prompt_intent = self.prompt_state.lock().resolve(&state);
         state
     }
 
@@ -1075,6 +1413,10 @@ impl RustCloudBackupManager {
         self.set_status(Self::runtime_status_for(&db_state));
         self.refresh_persisted_flags();
         self.set_pending_upload_verification(self.has_pending_cloud_upload_verification());
+    }
+
+    pub fn cloud_storage_did_change(&self) {
+        self.refresh_sync_health();
     }
 
     /// Check if cloud backup is enabled, used as nav guard
@@ -1147,6 +1489,7 @@ impl RustCloudBackupManager {
         let _ = db.cloud_blob_sync_states.delete_all();
 
         self.clear_pending_verification_completion();
+        self.clear_prompt_state();
         self.set_progress(None);
         self.set_restore_progress(None);
         self.set_restore_report(None);
@@ -1160,16 +1503,14 @@ impl RustCloudBackupManager {
         self.set_cloud_only(CloudOnlyState::NotFetched);
         self.set_cloud_only_operation(CloudOnlyOperation::Idle);
         self.set_status(CloudBackupStatus::Disabled);
-        cove_tokio::task::block_on(call!(self.runtime.clear_upload_runtime_state()))
-            .unwrap_or_else(|error| {
-                error!("Failed to clear cloud backup runtime upload state: {error}");
-            });
+        self.refresh_sync_health();
+        send!(self.runtime.clear_upload_runtime_state());
         info!("Debug: reset cloud backup local state (including master key)");
     }
 
     /// Background startup health check for cloud backup integrity
-    pub fn verify_backup_integrity(&self) -> Option<String> {
-        self.verify_backup_integrity_impl()
+    pub async fn verify_backup_integrity(&self) -> Option<String> {
+        self.verify_backup_integrity_impl().await
     }
 
     /// Back up a newly created wallet, fire-and-forget
@@ -1197,11 +1538,26 @@ impl RustCloudBackupManager {
         send!(self.runtime.start_operation(CloudBackupOperation::EnableNoDiscovery, None));
     }
 
+    /// Dismiss staged enable state for the existing-backup confirmation flow
     pub(crate) fn discard_pending_enable_cloud_backup(&self) {
-        cove_tokio::task::block_on(call!(self.runtime.discard_pending_enable_session()))
-            .unwrap_or_else(|error| {
-                error!("Failed to discard pending enable session: {error}");
-            });
+        if let Some(pending) = self.take_pending_enable_session() {
+            let should_delete_remote = pending.is_retry_upload();
+            let namespace_id = pending.master_key.namespace_id();
+
+            cove_cspp::Cspp::new(Keychain::global().clone()).delete_master_key();
+
+            if should_delete_remote {
+                cove_tokio::task::spawn(async move {
+                    if let Err(error) = CloudStorage::global()
+                        .delete_wallet_backup(namespace_id, MASTER_KEY_RECORD_ID.to_string())
+                        .await
+                    {
+                        warn!("Discard pending enable failed to delete remote master key: {error}");
+                    }
+                });
+            }
+        }
+        self.clear_existing_backup_found_prompt();
     }
 
     pub(crate) fn cancel_restore(&self) {
@@ -1211,6 +1567,17 @@ impl RustCloudBackupManager {
     pub(crate) fn restore_from_cloud_backup(&self) {
         info!("restore_from_cloud_backup: enqueueing restore task");
         send!(self.runtime.start_restore_from_cloud_backup());
+    }
+
+    fn clear_prompt_state(&self) {
+        {
+            let mut prompt_state = self.prompt_state.lock();
+            prompt_state.clear_existing_backup_found();
+            prompt_state.clear_passkey_choice();
+            prompt_state.clear_missing_passkey_dismissal();
+        }
+
+        self.refresh_prompt_intent();
     }
 }
 
@@ -1398,7 +1765,8 @@ pub(crate) fn ensure_cloud_backup_test_tokio_runtime() {
                     .build()
                     .expect("create cloud backup test tokio runtime");
 
-                runtime.block_on(async move {
+                let drive_runtime = tokio::runtime::Runtime::block_on;
+                drive_runtime(&runtime, async move {
                     cove_tokio::init();
                     sender.send(()).expect("signal cloud backup test tokio runtime");
                     std::future::pending::<()>().await;
@@ -1411,34 +1779,21 @@ pub(crate) fn ensure_cloud_backup_test_tokio_runtime() {
 
 #[cfg(test)]
 impl RustCloudBackupManager {
-    pub(crate) fn clear_wallet_upload_debouncers_for_test(&self) {
-        let runtime = self.runtime.clone();
-        std::thread::spawn(move || {
-            cove_tokio::task::block_on(call!(runtime.clear_upload_runtime_state()))
-                .expect("clear upload runtime state");
-        })
-        .join()
-        .expect("clear upload runtime state thread");
+    pub(crate) async fn clear_wallet_upload_debouncers_for_test(&self) {
+        act_zero::call!(self.runtime.clear_upload_runtime_state())
+            .await
+            .expect("clear upload runtime state");
     }
 
-    pub(crate) fn verify_pending_uploads_once_for_test(&self) -> bool {
-        self.verify_pending_uploads_once()
-    }
-
-    pub(crate) fn has_wallet_upload_debouncer_for_test(&self, wallet_id: WalletId) -> bool {
-        let runtime = self.runtime.clone();
-        std::thread::spawn(move || {
-            cove_tokio::task::block_on(call!(runtime.has_upload_debouncer_for_test(wallet_id)))
-                .expect("check upload debouncer")
-        })
-        .join()
-        .expect("check upload debouncer thread")
+    pub(crate) async fn verify_pending_uploads_once_for_test(&self) -> bool {
+        self.verify_pending_uploads_once().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use act_zero::call;
     use tempfile::TempDir;
 
     fn test_lock() -> &'static parking_lot::Mutex<()> {
@@ -1452,22 +1807,28 @@ mod tests {
 
     fn new_restore_operation(manager: &RustCloudBackupManager) -> RestoreOperation {
         let runtime = manager.runtime.clone();
-        std::thread::spawn(move || {
-            cove_tokio::task::block_on(call!(runtime.new_restore_operation()))
-                .expect("create restore operation")
-        })
-        .join()
-        .expect("create restore operation thread")
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let _task = cove_tokio::task::spawn(async move {
+            let result = call!(runtime.new_restore_operation()).await;
+            sender.send(result).expect("send restore operation result");
+        });
+        receiver
+            .recv()
+            .expect("receive restore operation result")
+            .expect("create restore operation")
     }
 
     fn invalidate_restore_operation(manager: &RustCloudBackupManager) {
         let runtime = manager.runtime.clone();
-        std::thread::spawn(move || {
-            cove_tokio::task::block_on(call!(runtime.invalidate_restore_operation()))
-                .expect("invalidate restore operation");
-        })
-        .join()
-        .expect("invalidate restore operation thread");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let _task = cove_tokio::task::spawn(async move {
+            let result = call!(runtime.invalidate_restore_operation()).await;
+            sender.send(result).expect("send invalidate restore operation result");
+        });
+        receiver
+            .recv()
+            .expect("receive invalidate restore operation result")
+            .expect("invalidate restore operation");
     }
 
     #[test]

@@ -76,10 +76,6 @@ struct CoveMainView: View {
     @State var showCover: Bool = true
     @State var scannedCode: TaggedItem<MultiFormat>? = .none
     @State var coverClearTask: Task<Void, Never>?
-    @State private var showMissingPasskeyAlert = false
-    @State private var showCloudBackupVerificationPrompt = false
-    @State private var pendingMissingPasskeyAlert = false
-    @State private var keepShowingCloudBackupVerificationPrompt = false
     @State private var startupTorUnavailable: StartupTorUnavailable?
     @State private var startupTorCheckSignature: String?
 
@@ -318,43 +314,6 @@ struct CoveMainView: View {
         )
     }
 
-    private var canPresentMissingPasskeyAlert: Bool {
-        phase == .active &&
-            auth.lockState == .unlocked &&
-            !showCover &&
-            app.alertState == nil &&
-            app.sheetState == nil &&
-            !app.isCloudBackupRootPromptBlocked
-    }
-
-    private var canPresentCloudBackupVerificationPrompt: Bool {
-        phase == .active &&
-            auth.lockState == .unlocked &&
-            !showCover &&
-            app.alertState == nil &&
-            app.sheetState == nil &&
-            !showMissingPasskeyAlert &&
-            !app.isCloudBackupRootPromptBlocked
-    }
-
-    private var isCloudBackupPasskeyMissing: Bool {
-        if case .passkeyMissing = CloudBackupManager.shared.status { return true }
-        return false
-    }
-
-    private var isRepairingCloudBackupPasskey: Bool {
-        if case .recovering(.repairPasskey) = CloudBackupManager.shared.recovery { return true }
-        return false
-    }
-
-    private var isViewingCloudBackup: Bool {
-        app.currentRoute.isEqual(routeToCheck: .settings(.cloudBackup))
-    }
-
-    private var shouldSuppressMissingPasskeyAlert: Bool {
-        isRepairingCloudBackupPasskey || isViewingCloudBackup
-    }
-
     var navBarColor: Color {
         switch app.currentRoute {
         case .newWallet(.hotWallet(.create)):
@@ -365,240 +324,6 @@ struct CoveMainView: View {
             Color.white
         default:
             Color.blue
-        }
-    }
-
-    @MainActor
-    func importHotWallet(_ words: [String]) {
-        do {
-            let manager = ImportWalletManager()
-            let walletMetadata = try manager.rust.importWallet(enteredWords: [words])
-            try app.rust.selectWallet(id: walletMetadata.id)
-        } catch let error as ImportWalletError {
-            switch error {
-            case let .InvalidWordGroup(error):
-                Log.debug("Invalid words: \(error)")
-                app.alertState = TaggedItem(.invalidWordGroup)
-            case let .WalletAlreadyExists(walletId):
-                Log.warn("Attempted to import words for an existing hot wallet: \(walletId)")
-                app.alertState = TaggedItem(.duplicateWallet(walletId: walletId))
-            default:
-                Log.error("Unable to import wallet: \(error)")
-                app.alertState = TaggedItem(
-                    .errorImportingHotWallet(message: error.localizedDescription)
-                )
-            }
-        } catch {
-            Log.error("Unknown error \(error)")
-            app.alertState = TaggedItem(
-                .errorImportingHotWallet(message: error.localizedDescription)
-            )
-        }
-    }
-
-    func importColdWallet(_ export: HardwareExport) {
-        do {
-            let wallet = try Wallet.newFromExport(export: export)
-            let id = wallet.id()
-            Log.debug("Imported Wallet: \(id)")
-            app.alertState = TaggedItem(.importedSuccessfully)
-
-            // if we're not already on this wallet, navigate to it
-            if app.walletManager?.id != id { try app.rust.selectWallet(id: id) }
-
-            // upgrade watch-only → cold in-place
-            if app.walletManager?.id == id, app.walletManager?.walletMetadata.walletType != .hot {
-                try app.walletManager?.rust.setWalletType(walletType: .cold)
-            }
-        } catch let WalletError.WalletAlreadyExists(id) {
-            app.alertState = TaggedItem(.duplicateWallet(walletId: id))
-
-            if (try? app.rust.selectWallet(id: id)) == nil { app.alertState = TaggedItem(.unableToSelectWallet) }
-        } catch {
-            app.alertState = TaggedItem(
-                .errorImportingHardwareWallet(message: error.localizedDescription)
-            )
-        }
-    }
-
-    func handleAddress(_ addressWithNetwork: AddressWithNetwork) {
-        let currentNetwork = Database().globalConfig().selectedNetwork()
-        let address = addressWithNetwork.address()
-        let network = addressWithNetwork.network()
-        let selectedWallet = Database().globalConfig().selectedWallet()
-
-        if selectedWallet == nil {
-            app.alertState = TaggedItem(AppAlertState.noWalletSelected(address: address))
-            return
-        }
-
-        if !addressWithNetwork.isValidForNetwork(network: currentNetwork) {
-            app.alertState = TaggedItem(
-                AppAlertState.addressWrongNetwork(
-                    address: address, network: network, currentNetwork: currentNetwork
-                )
-            )
-            return
-        }
-
-        let amount = addressWithNetwork.amount()
-        app.alertState = TaggedItem(.foundAddress(address: address, amount: amount))
-    }
-
-    func handleTransaction(_ transaction: BitcoinTransaction) {
-        Log.debug(
-            "Received BitcoinTransaction: \(transaction): \(transaction.txIdHash())"
-        )
-
-        let db = Database().unsignedTransactions()
-        let txnRecord = db.getTx(txId: transaction.txId())
-
-        guard let txnRecord else {
-            Log.error("No unsigned transaction found for \(transaction.txId())")
-            app.alertState = .init(.noUnsignedTransactionFound(txId: transaction.txId()))
-            return
-        }
-
-        let route = RouteFactory().sendConfirm(
-            id: txnRecord.walletId(), details: txnRecord.confirmDetails(),
-            signedTransaction: transaction
-        )
-
-        app.pushRoute(route)
-    }
-
-    func handleSignedPsbt(_ psbt: Psbt) {
-        Log.debug("Received signed PSBT: \(psbt.txId())")
-
-        let db = Database().unsignedTransactions()
-        let txnRecord = db.getTx(txId: psbt.txId())
-
-        guard let txnRecord else {
-            Log.error("No unsigned transaction found for PSBT \(psbt.txId())")
-            app.alertState = .init(.noUnsignedTransactionFound(txId: psbt.txId()))
-            return
-        }
-
-        let route = RouteFactory().sendConfirm(
-            id: txnRecord.walletId(), details: txnRecord.confirmDetails(),
-            signedPsbt: psbt
-        )
-
-        app.pushRoute(route)
-    }
-
-    func handleFileOpen(_ url: URL) {
-        let fileHandler = FileHandler(filePath: url.absoluteString)
-
-        do {
-            let readResult = try fileHandler.read()
-            switch readResult {
-            case let .mnemonic(mnemonic):
-                importHotWallet(mnemonic.words())
-            case let .hardwareExport(export):
-                importColdWallet(export)
-            case let .address(addressWithNetwork):
-                handleAddress(addressWithNetwork)
-            case let .transaction(txn):
-                handleTransaction(txn)
-            case let .tapSignerUnused(tapSigner):
-                app.sheetState = .init(.tapSigner(TapSignerRoute.initSelect(tapSigner)))
-            case let .tapSignerReady(tapSigner):
-                let panic =
-                    "TAPSIGNER not implemented \(tapSigner) doesn't make sense for file import"
-                Log.error(panic)
-            case let .bip329Labels(labels):
-                if let selectedWallet = Database().globalConfig().selectedWallet() {
-                    return try LabelManager(id: selectedWallet).import(labels: labels)
-                }
-
-                app.alertState = TaggedItem(
-                    .invalidFileFormat(
-                        message:
-                        "Currently BIP329 labels must be imported through the wallet actions"
-                    )
-                )
-            case let .signedPsbt(psbt):
-                handleSignedPsbt(psbt)
-            }
-        } catch {
-            switch error {
-            case let FileHandlerError.NotRecognizedFormat(multiFormatError):
-                Log.error("Unrecognized format mulit format error: \(multiFormatError)")
-                app.alertState = TaggedItem(
-                    .invalidFileFormat(message: multiFormatError.localizedDescription)
-                )
-
-            case let FileHandlerError.OpenFile(error):
-                Log.error("File handler error: \(error)")
-
-            case let FileHandlerError.ReadFile(error):
-                Log.error("Unable to read file: \(error)")
-
-            case FileHandlerError.FileNotFound:
-                Log.error("File not found")
-
-            default:
-                Log.error("Unknown error file handling file: \(error)")
-            }
-        }
-    }
-
-    func setInvalidlabels() {
-        app.alertState = TaggedItem(
-            .invalidFileFormat(
-                message: "Currently BIP329 labels must be imported through the wallet actions"
-            )
-        )
-    }
-
-    @MainActor
-    func handleMultiFormat(_ multiFormat: MultiFormat) {
-        do {
-            switch multiFormat {
-            case let .mnemonic(mnemonic):
-                importHotWallet(mnemonic.words())
-            case let .hardwareExport(export):
-                importColdWallet(export)
-            case let .address(addressWithNetwork):
-                handleAddress(addressWithNetwork)
-            case let .transaction(transaction):
-                handleTransaction(transaction)
-            case let .signedPsbt(psbt):
-                handleSignedPsbt(psbt)
-            case let .tapSignerUnused(tapSigner):
-                app.alertState = .init(.uninitializedTapSigner(tapSigner: tapSigner))
-            case let .tapSignerReady(tapSigner):
-                if let wallet = app.findTapSignerWallet(tapSigner) {
-                    app.alertState = .init(.tapSignerWalletFound(walletId: wallet.id))
-                } else {
-                    app.alertState = .init(.initializedTapSigner(tapSigner: tapSigner))
-                }
-            case let .bip329Labels(labels):
-                guard let manager = app.walletManager else { return setInvalidlabels() }
-                guard let selectedWallet = Database().globalConfig().selectedWallet() else {
-                    return setInvalidlabels()
-                }
-
-                // import the labels
-                try LabelManager(id: selectedWallet).import(labels: labels)
-                app.alertState = .init(.importedLabelsSuccessfully)
-
-                // when labels are imported, we need to get the transactions again with the updated labels
-                Task { await manager.rust.getTransactions() }
-            }
-        } catch {
-            switch error {
-            case let multiFormatError as MultiFormatError:
-                Log.error(
-                    "MultiFormat not recognized: \(multiFormatError): \(multiFormatError.description)"
-                )
-                app.alertState = TaggedItem(.invalidFormat(message: multiFormatError.description))
-
-            default:
-                Log.error("Unable to handle scanned code, error: \(error)")
-                app.alertState = TaggedItem(.invalidFileFormat(message: error.localizedDescription))
-            }
         }
     }
 
@@ -668,14 +393,8 @@ struct CoveMainView: View {
             Log.warn("AUTH LOCK STATE CHANGED: \(old) --> \(new)")
 
             if new == .unlocked {
-                scheduleMissingPasskeyAlert()
-                scheduleCloudBackupVerificationPrompt()
                 Task { await checkStartupTorAvailabilityIfNeeded() }
-                return
             }
-
-            showMissingPasskeyAlert = false
-            showCloudBackupVerificationPrompt = false
         }
         .environment(app)
         .environment(auth)
@@ -697,28 +416,13 @@ struct CoveMainView: View {
         Log.debug("[COVE APP ROOT] onChangeQr")
         guard let scannedCode else { return }
         app.sheetState = .none
-        handleMultiFormat(scannedCode.item)
+        ScanManager.shared.handleMultiFormat(scannedCode.item)
     }
 
     func onChangeNfc(_: NfcMessage?, _ nfcMessage: NfcMessage?) {
         Log.debug("[COVE APP ROOT] onChangeNfc")
         guard let nfcMessage else { return }
-        do {
-            let multiFormat = try nfcMessage.tryIntoMultiFormat()
-            handleMultiFormat(multiFormat)
-        } catch {
-            switch error {
-            case let multiFormatError as MultiFormatError:
-                Log.error(
-                    "MultiFormat not recognized: \(multiFormatError): \(multiFormatError.description)"
-                )
-                app.alertState = TaggedItem(.invalidFormat(message: multiFormatError.description))
-
-            default:
-                Log.error("Unable to handle scanned code, error: \(error)")
-                app.alertState = TaggedItem(.invalidFileFormat(message: error.localizedDescription))
-            }
-        }
+        ScanManager.shared.handleNfcScan(nfcMessage)
     }
 
     func handleScenePhaseChange(_ oldPhase: ScenePhase, _ newPhase: ScenePhase) {
@@ -736,8 +440,6 @@ struct CoveMainView: View {
             guard app.asyncRuntimeReady else { return }
             app.dispatch(action: AppAction.updateFees)
             app.dispatch(action: AppAction.updateFiatPrices)
-            scheduleMissingPasskeyAlert()
-            scheduleCloudBackupVerificationPrompt()
             Task { await checkStartupTorAvailabilityIfNeeded() }
         }
 
@@ -825,106 +527,6 @@ struct CoveMainView: View {
         }
     }
 
-    private func scheduleMissingPasskeyAlert() {
-        // this blocker-based coordination is an intentional bridge until the
-        // Rust-owned cloud-backup presentation refactor in issue #619 replaces it
-        guard isCloudBackupPasskeyMissing else {
-            pendingMissingPasskeyAlert = false
-            showMissingPasskeyAlert = false
-            return
-        }
-
-        if shouldSuppressMissingPasskeyAlert {
-            pendingMissingPasskeyAlert = false
-            showMissingPasskeyAlert = false
-            return
-        }
-
-        guard canPresentMissingPasskeyAlert else {
-            pendingMissingPasskeyAlert = true
-            return
-        }
-
-        pendingMissingPasskeyAlert = false
-        showMissingPasskeyAlert = true
-    }
-
-    private func dismissMissingPasskeyAlert() {
-        pendingMissingPasskeyAlert = false
-        showMissingPasskeyAlert = false
-    }
-
-    private func scheduleCloudBackupVerificationPrompt() {
-        if CloudBackupManager.shared.isBackgroundVerifying {
-            keepShowingCloudBackupVerificationPrompt = false
-            showCloudBackupVerificationPrompt = false
-            return
-        }
-
-        if keepShowingCloudBackupVerificationPrompt {
-            guard canPresentCloudBackupVerificationPrompt else {
-                showCloudBackupVerificationPrompt = false
-                return
-            }
-
-            showCloudBackupVerificationPrompt = true
-            return
-        }
-
-        guard CloudBackupManager.shared.shouldPromptVerification else {
-            showCloudBackupVerificationPrompt = false
-            return
-        }
-
-        guard canPresentCloudBackupVerificationPrompt else {
-            showCloudBackupVerificationPrompt = false
-            return
-        }
-
-        showCloudBackupVerificationPrompt = true
-    }
-
-    private func dismissCloudBackupVerificationPrompt() {
-        keepShowingCloudBackupVerificationPrompt = false
-        showCloudBackupVerificationPrompt = false
-        CloudBackupManager.shared.dispatch(action: .dismissVerificationPrompt)
-    }
-
-    private func startCloudBackupVerification() {
-        keepShowingCloudBackupVerificationPrompt = true
-        CloudBackupManager.shared.dispatch(action: .startVerification)
-    }
-
-    private func handleCloudBackupVerificationChange(_ verification: VerificationState) {
-        switch verification {
-        case .verified, .passkeyConfirmed, .cancelled:
-            keepShowingCloudBackupVerificationPrompt = false
-            showCloudBackupVerificationPrompt = false
-        case .verifying where CloudBackupManager.shared.isBackgroundVerifying:
-            keepShowingCloudBackupVerificationPrompt = false
-            showCloudBackupVerificationPrompt = false
-        case .failed:
-            keepShowingCloudBackupVerificationPrompt = true
-            scheduleCloudBackupVerificationPrompt()
-        case .verifying:
-            keepShowingCloudBackupVerificationPrompt = true
-            scheduleCloudBackupVerificationPrompt()
-        case .idle:
-            if !CloudBackupManager.shared.shouldPromptVerification { keepShowingCloudBackupVerificationPrompt = false }
-        }
-    }
-
-    private func openCloudBackupScreen() {
-        dismissMissingPasskeyAlert()
-
-        let route = Route.settings(.cloudBackup)
-        if app.currentRoute.isEqual(routeToCheck: route) {
-            return
-        }
-
-        app.pushRoute(route)
-    }
-
     @MainActor
     private func checkStartupTorAvailabilityIfNeeded() async {
         guard phase == .active else { return }
@@ -1006,311 +608,39 @@ struct CoveMainView: View {
     }
 
     var body: some View {
-        BodyView
-            .id(id)
-            .environment(\.navigate) { route in
-                app.pushRoute(route)
-            }
-            .environment(app)
-            .preferredColorScheme(app.colorScheme)
-            .onChange(of: app.router.routes, onChangeRoute)
-            .onChange(of: app.selectedNetwork) { id = UUID() }
-            // QR code scanning
-            .onChange(of: scannedCode, onChangeQr)
-            // NFC scanning
-            .onChange(of: app.nfcReader.scannedMessage, onChangeNfc)
-            .alert(
-                app.alertState?.item.title() ?? "Alert",
-                isPresented: showingAlert,
-                presenting: app.alertState,
-                actions: alertButtons,
-                message: alertMessage
-            )
-            .alert(
-                "Cloud Backup Passkey Missing",
-                isPresented: $showMissingPasskeyAlert
-            ) {
-                Button("Open Cloud Backup") {
-                    openCloudBackupScreen()
+        CloudBackupPresentationHost(app: app, auth: auth, isCoverPresented: showCover) {
+            BodyView
+                .id(id)
+                .environment(\.navigate) { route in
+                    app.pushRoute(route)
                 }
-                Button("Not Now", role: .cancel) {
-                    dismissMissingPasskeyAlert()
-                }
-            } message: {
-                Text(
-                    "Add a new passkey to restore access to your cloud backup. Until you do, your backups can't be restored."
+                .environment(app)
+                .preferredColorScheme(app.colorScheme)
+                .onChange(of: app.router.routes, onChangeRoute)
+                .onChange(of: app.selectedNetwork) { id = UUID() }
+                .onChange(of: scannedCode, onChangeQr)
+                .onChange(of: app.nfcReader.scannedMessage, onChangeNfc)
+                .alert(
+                    app.alertState?.item.title() ?? "Alert",
+                    isPresented: showingAlert,
+                    presenting: app.alertState,
+                    actions: alertButtons,
+                    message: alertMessage
                 )
-            }
-            .modifier(StartupTorWarningModifier(
-                warning: $startupTorUnavailable,
-                openOrbot: openOrbotFromStartupWarning,
-                openNetworkSettings: {
-                    startupTorUnavailable = nil
-                    app.pushRoute(.settings(.network))
-                },
-                useClearnetNode: {
-                    Task { await useClearnetAfterStartupTorFailure() }
-                }
-            ))
-            .fullScreenCover(isPresented: $showCloudBackupVerificationPrompt) {
-                CloudBackupVerificationPromptView(
-                    onDismiss: dismissCloudBackupVerificationPrompt,
-                    onVerify: startCloudBackupVerification
-                )
-                .interactiveDismissDisabled(true)
-            }
-            .sheet(item: $app.sheetState, content: SheetContent)
-            .onOpenURL(perform: handleFileOpen)
-            .onChange(of: phase, initial: true, handleScenePhaseChange)
-            .onChange(of: CloudBackupManager.shared.status) { _, status in
-                if case .passkeyMissing = status {
-                    keepShowingCloudBackupVerificationPrompt = false
-                    scheduleMissingPasskeyAlert()
-                    showCloudBackupVerificationPrompt = false
-                } else {
-                    dismissMissingPasskeyAlert()
-                    scheduleCloudBackupVerificationPrompt()
-                }
-            }
-            .onChange(of: CloudBackupManager.shared.recovery) { _, recovery in
-                if case .recovering(.repairPasskey) = recovery {
-                    dismissMissingPasskeyAlert()
-                } else if isCloudBackupPasskeyMissing {
-                    scheduleMissingPasskeyAlert()
-                }
-            }
-            .onChange(of: CloudBackupManager.shared.verification) { _, verification in
-                handleCloudBackupVerificationChange(verification)
-            }
-            .onChange(of: app.isCloudBackupRootPromptBlocked) { _, isBlocked in
-                if isBlocked {
-                    if isCloudBackupPasskeyMissing {
-                        pendingMissingPasskeyAlert = true
-                    }
-                    showMissingPasskeyAlert = false
-                    showCloudBackupVerificationPrompt = false
-                    return
-                }
-
-                if pendingMissingPasskeyAlert {
-                    scheduleMissingPasskeyAlert()
-                } else {
-                    scheduleCloudBackupVerificationPrompt()
-                }
-            }
-            .onChange(of: app.router.routes) { _, _ in
-                if isViewingCloudBackup {
-                    dismissMissingPasskeyAlert()
-                } else if isCloudBackupPasskeyMissing {
-                    scheduleMissingPasskeyAlert()
-                }
-
-                scheduleCloudBackupVerificationPrompt()
-            }
-            .onChange(of: showCover) { _, isShowing in
-                if !isShowing, pendingMissingPasskeyAlert {
-                    scheduleMissingPasskeyAlert()
-                }
-                if isShowing {
-                    showCloudBackupVerificationPrompt = false
-                } else {
-                    scheduleCloudBackupVerificationPrompt()
-                }
-            }
-            .onChange(of: app.alertState) { _, alertState in
-                if alertState == nil, pendingMissingPasskeyAlert {
-                    scheduleMissingPasskeyAlert()
-                }
-                if alertState == nil {
-                    scheduleCloudBackupVerificationPrompt()
-                } else {
-                    showCloudBackupVerificationPrompt = false
-                }
-            }
-            .onChange(of: app.sheetState) { _, sheetState in
-                if sheetState == nil, pendingMissingPasskeyAlert {
-                    scheduleMissingPasskeyAlert()
-                }
-                if sheetState == nil {
-                    scheduleCloudBackupVerificationPrompt()
-                } else {
-                    showCloudBackupVerificationPrompt = false
-                }
-            }
-            .onChange(of: showMissingPasskeyAlert) { _, isShowing in
-                if isShowing {
-                    showCloudBackupVerificationPrompt = false
-                } else {
-                    scheduleCloudBackupVerificationPrompt()
-                }
-            }
-            .onChange(of: CloudBackupManager.shared.shouldPromptVerification) { _, shouldPrompt in
-                if shouldPrompt {
-                    scheduleCloudBackupVerificationPrompt()
-                    return
-                }
-
-                if CloudBackupManager.shared.isBackgroundVerifying {
-                    keepShowingCloudBackupVerificationPrompt = false
-                    showCloudBackupVerificationPrompt = false
-                    return
-                }
-
-                if !keepShowingCloudBackupVerificationPrompt {
-                    showCloudBackupVerificationPrompt = false
-                }
-            }
-    }
-}
-
-private struct CloudBackupVerificationPromptView: View {
-    @State private var manager = CloudBackupManager.shared
-
-    let onDismiss: () -> Void
-    let onVerify: () -> Void
-
-    private var isVerifying: Bool {
-        if case .verifying = manager.verification { return true }
-        return false
-    }
-
-    private var failure: DeepVerificationFailure? {
-        guard !manager.shouldPromptVerification else { return nil }
-        if case let .failed(failure) = manager.verification { return failure }
-        return nil
-    }
-
-    private var title: String {
-        if isVerifying {
-            return "Verifying Cloud Backup"
+                .sheet(item: $app.sheetState, content: SheetContent)
+                .onOpenURL(perform: ScanManager.shared.handleFileOpen)
+                .onChange(of: phase, initial: true, handleScenePhaseChange)
         }
-
-        if failure != nil {
-            return "Verification Failed"
-        }
-
-        return "Verify"
-    }
-
-    private var message: String {
-        if let failure {
-            return failure.message
-        }
-
-        if isVerifying {
-            return "Confirming your updated cloud backup can be decrypted and restored. Continuing may ask for your passkey."
-        }
-
-        return "Verify your updated cloud backup now to confirm it is accessible. Continuing may ask for your passkey."
-    }
-
-    private var primaryButtonTitle: String {
-        failure == nil ? "Verify" : "Try Again"
-    }
-
-    private var heroIconName: String {
-        failure == nil ? "checkmark.shield.fill" : "exclamationmark.triangle.fill"
-    }
-
-    private var heroTint: Color {
-        failure == nil ? .btnGradientLight : .orange
-    }
-
-    private var heroFillColor: Color {
-        failure == nil ? Color.duskBlue.opacity(0.42) : Color.orange.opacity(0.12)
-    }
-
-    var body: some View {
-        ScrollView(.vertical) {
-            VStack(spacing: 0) {
-                HStack {
-                    Spacer()
-
-                    if !isVerifying {
-                        Button(action: onDismiss) {
-                            Image(systemName: "xmark")
-                                .font(.headline)
-                                .foregroundStyle(.white.opacity(0.85))
-                                .frame(width: 44, height: 44)
-                        }
-                    }
-                }
-                .padding(.top, 4)
-
-                Spacer()
-                    .frame(height: 20)
-
-                heroView
-
-                Spacer()
-                    .frame(height: 36)
-
-                VStack(spacing: 12) {
-                    HStack {
-                        Text(title)
-                            .font(.system(size: 38, weight: .semibold))
-                            .foregroundStyle(.white)
-
-                        Spacer()
-                    }
-
-                    HStack {
-                        Text(message)
-                            .font(OnboardingRecoveryTypography.body)
-                            .foregroundStyle(.coveLightGray.opacity(0.76))
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        Spacer()
-                    }
-                }
-
-                Spacer()
-                    .frame(height: 28)
-
-                Divider()
-                    .overlay(Color.coveLightGray.opacity(0.14))
-
-                Spacer(minLength: 24)
-
-                if !isVerifying {
-                    VStack(spacing: 14) {
-                        Button(primaryButtonTitle, action: onVerify)
-                            .buttonStyle(OnboardingPrimaryButtonStyle())
-
-                        Button("Later", action: onDismiss)
-                            .buttonStyle(OnboardingSecondaryButtonStyle())
-                    }
-                }
-
-                Spacer(minLength: 0)
+        .modifier(StartupTorWarningModifier(
+            warning: $startupTorUnavailable,
+            openOrbot: openOrbotFromStartupWarning,
+            openNetworkSettings: {
+                startupTorUnavailable = nil
+                app.pushRoute(.settings(.network))
+            },
+            useClearnetNode: {
+                Task { await useClearnetAfterStartupTorFailure() }
             }
-            .frame(maxWidth: .infinity, alignment: .top)
-        }
-        .padding(.horizontal, 28)
-        .padding(.bottom, 28)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onboardingRecoveryBackground()
-        .animation(.easeInOut(duration: 0.25), value: isVerifying)
-        .animation(.easeInOut(duration: 0.25), value: failure != nil)
-    }
-
-    @ViewBuilder
-    private var heroView: some View {
-        if isVerifying {
-            OnboardingStatusHero(
-                systemImage: heroIconName,
-                tint: heroTint,
-                fillColor: heroFillColor,
-                pulse: true,
-                iconSize: 22
-            )
-        } else {
-            OnboardingStatusHero(
-                systemImage: heroIconName,
-                tint: heroTint,
-                fillColor: heroFillColor,
-                iconSize: failure == nil ? 22 : 24
-            )
-        }
+        ))
     }
 }

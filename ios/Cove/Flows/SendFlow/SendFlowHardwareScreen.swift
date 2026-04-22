@@ -441,14 +441,8 @@ struct SendFlowHardwareScreen: View {
             app.nfcWriter.writeToTag(data: details.psbtBytes())
         }
 
-        ShareLink(
-            item: PSBTFile(data: details.psbtBytes(), filename: "transaction.psbt"),
-            preview: SharePreview(
-                "transaction.psbt - A Partially Signed Bitcoin Transaction",
-                image: Image(.bitcoinShield)
-            )
-        ) {
-            Text("More...")
+        Button("More...") {
+            ShareSheet.presentFromMenu(data: details.psbtBytes(), filename: "transaction.psbt")
         }
     }
 

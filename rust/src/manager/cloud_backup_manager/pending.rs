@@ -11,8 +11,8 @@ use self::queue_processor::PendingUploadVerifier;
 use super::{CloudBackupError, RustCloudBackupManager};
 use crate::database::Database;
 use crate::database::cloud_backup::{
-    CloudBlobFailedState, CloudBlobUploadedPendingConfirmationState, CloudUploadKind,
-    PersistedCloudBlobState, PersistedCloudBlobSyncState,
+    CloudBlobDirtyState, CloudBlobFailedState, CloudBlobUploadedPendingConfirmationState,
+    CloudUploadKind, PersistedCloudBlobState, PersistedCloudBlobSyncState,
 };
 use crate::wallet::metadata::WalletId;
 
@@ -129,6 +129,22 @@ impl RustCloudBackupManager {
         )
     }
 
+    pub(crate) fn mark_blob_dirty_state(
+        &self,
+        current_state: &PersistedCloudBlobSyncState,
+    ) -> Result<(), CloudBackupError> {
+        let changed_at = jiff::Timestamp::now().as_second().try_into().unwrap_or(0);
+        let dirty_state = PersistedCloudBlobSyncState {
+            state: PersistedCloudBlobState::Dirty(CloudBlobDirtyState { changed_at }),
+            ..current_state.clone()
+        };
+
+        Database::global()
+            .cloud_blob_sync_states
+            .set(&dirty_state)
+            .map_err_prefix("persist dirty cloud blob state", CloudBackupError::Internal)
+    }
+
     pub(super) fn remove_blob_sync_states<I>(&self, record_ids: I) -> Result<(), CloudBackupError>
     where
         I: IntoIterator<Item = String>,
@@ -151,11 +167,11 @@ impl RustCloudBackupManager {
         send!(self.runtime.ensure_pending_upload_verification_loop());
     }
 
-    pub(crate) fn verify_pending_uploads_once(&self) -> bool {
-        PendingUploadVerifier(self.clone()).run_once()
+    pub(crate) async fn verify_pending_uploads_once(&self) -> bool {
+        PendingUploadVerifier(self.clone()).run_once().await
     }
 
-    fn wake_pending_upload_verifier(&self) {
+    pub(crate) fn wake_pending_upload_verifier(&self) {
         send!(self.runtime.wake_pending_upload_verifier());
     }
 }

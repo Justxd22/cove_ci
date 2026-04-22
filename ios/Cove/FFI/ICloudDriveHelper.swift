@@ -11,6 +11,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
     private let pollInterval: TimeInterval = 0.1
     let metadataSettleInterval: TimeInterval = 0.5
     private let progressLogInterval: TimeInterval = 1
+    private static let legacyFileReadNoSuchFileError = 4
 
     final class ObserverBox {
         private var observers: [NSObjectProtocol] = []
@@ -83,6 +84,53 @@ final class ICloudDriveHelper: @unchecked Sendable {
                 message
             }
         }
+    }
+
+    private static func isConnectivityError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [
+                .notConnectedToInternet,
+                .networkConnectionLost,
+                .timedOut,
+                .cannotFindHost,
+                .cannotConnectToHost,
+                .dnsLookupFailed,
+                .internationalRoamingOff,
+                .dataNotAllowed,
+            ].contains(urlError.code)
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            return [
+                NSURLErrorNotConnectedToInternet,
+                NSURLErrorNetworkConnectionLost,
+                NSURLErrorTimedOut,
+                NSURLErrorCannotFindHost,
+                NSURLErrorCannotConnectToHost,
+                NSURLErrorDNSLookupFailed,
+                NSURLErrorInternationalRoamingOff,
+                NSURLErrorDataNotAllowed,
+            ].contains(nsError.code)
+        }
+
+        return false
+    }
+
+    private static func uploadError(_ context: String, error: Error) -> CloudStorageError {
+        if isConnectivityError(error) {
+            return .Offline("\(context): \(error.localizedDescription)")
+        }
+
+        return .UploadFailed("\(context): \(error.localizedDescription)")
+    }
+
+    private static func downloadError(_ context: String, error: Error) -> CloudStorageError {
+        if isConnectivityError(error) {
+            return .Offline("\(context): \(error.localizedDescription)")
+        }
+
+        return .DownloadFailed("\(context): \(error.localizedDescription)")
     }
 
     // MARK: - Path mapping
@@ -164,6 +212,14 @@ final class ICloudDriveHelper: @unchecked Sendable {
         return try walletFileURL(namespace: namespace, recordId: recordId)
     }
 
+    func backupFileReadURL(namespace: String, recordId: String) throws -> URL {
+        if recordId == csppMasterKeyRecordId() {
+            return try masterKeyFileReadURL(namespace: namespace)
+        }
+
+        return try walletFileReadURL(namespace: namespace, recordId: recordId)
+    }
+
     // MARK: - File coordination
 
     /// Coordinates iCloud-backed filesystem access because ubiquitous items may
@@ -189,9 +245,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
         }
 
         if let error = coordinatorError ?? createError {
-            throw CloudStorageError.UploadFailed(
-                "create directory failed: \(error.localizedDescription)"
-            )
+            throw Self.uploadError("create directory failed", error: error)
         }
     }
 
@@ -211,7 +265,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
         }
 
         if let error = coordinatorError ?? writeError {
-            throw CloudStorageError.UploadFailed("write failed: \(error.localizedDescription)")
+            throw Self.uploadError("write failed", error: error)
         }
     }
 
@@ -261,9 +315,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
         }
 
         if let error = coordinatorError ?? moveError {
-            throw CloudStorageError.UploadFailed(
-                "setUbiquitous failed: \(error.localizedDescription)"
-            )
+            throw Self.uploadError("setUbiquitous failed", error: error)
         }
     }
 
@@ -284,7 +336,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
 
         if let error = coordinatorError ?? deleteError {
             if Self.isNoSuchFileError(error) { throw CloudStorageError.NotFound(missingItemID) }
-            throw CloudStorageError.UploadFailed("delete failed: \(error.localizedDescription)")
+            throw Self.uploadError("delete failed", error: error)
         }
     }
 
@@ -303,9 +355,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
         }
 
         if let error = coordinatorError {
-            throw CloudStorageError.DownloadFailed(
-                "file coordination error: \(error.localizedDescription)"
-            )
+            throw Self.downloadError("file coordination error", error: error)
         }
 
         guard let readResult else {
@@ -315,7 +365,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
         switch readResult {
         case let .success(data): return data
         case let .failure(error):
-            throw CloudStorageError.DownloadFailed(error.localizedDescription)
+            throw Self.downloadError("read failed", error: error)
         }
     }
 
@@ -324,25 +374,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
     /// Tries startDownloadingUbiquitousItem as a hint, then uses NSFileCoordinator
     /// which forces the download through a different (more reliable) path
     func downloadFile(url: URL, recordId: String) throws -> Data {
-        let filename = url.lastPathComponent
-
-        try ensureDownloaded(url: url, recordId: recordId)
-
-        let resolvedURL =
-            resolvedMetadataItemIfPresent(
-                named: filename,
-                parentDirectoryURL: url.deletingLastPathComponent()
-            )?.url ?? url
-
-        if resolvedURL != url {
-            Log.info(
-                "downloadFile: using metadata URL for \(filename) local=\(url.path) metadata=\(resolvedURL.path)"
-            )
-        } else {
-            Log.info("downloadFile: \(filename) reading via NSFileCoordinator")
-        }
-
-        return try coordinatedRead(from: resolvedURL)
+        try downloadData(url: url, recordId: recordId)
     }
 
     // MARK: - Upload verification
@@ -364,9 +396,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
                 )
             }
         } catch {
-            throw CloudStorageError.UploadFailed(
-                "iCloud metadata lookup failed for \(filename): \(error.localizedDescription)"
-            )
+            throw Self.uploadError("iCloud metadata lookup failed for \(filename)", error: error)
         }
     }
 
@@ -389,9 +419,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
                 deadline: deadline
             )
         } catch {
-            throw CloudStorageError.UploadFailed(
-                "iCloud metadata lookup failed for \(filename): \(error.localizedDescription)"
-            )
+            throw Self.uploadError("iCloud metadata lookup failed for \(filename)", error: error)
         }
 
         if resolvedItem.url != url {
@@ -419,9 +447,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
             }
 
             if case let .failed(error) = state {
-                throw CloudStorageError.UploadFailed(
-                    "iCloud upload failed for \(filename): \(error.localizedDescription)"
-                )
+                throw Self.uploadError("iCloud upload failed for \(filename)", error: error)
             }
 
             Thread.sleep(forTimeInterval: pollInterval)
@@ -436,7 +462,7 @@ final class ICloudDriveHelper: @unchecked Sendable {
             focusName: filename
         )
 
-        throw CloudStorageError.UploadFailed(
+        throw CloudStorageError.Offline(
             "iCloud upload timed out for \(filename) after \(defaultTimeout)s"
         )
     }
@@ -445,13 +471,18 @@ final class ICloudDriveHelper: @unchecked Sendable {
 
     /// Ensures the file is downloaded locally, triggering a download if evicted
     func ensureDownloaded(url: URL, recordId: String) throws {
-        // check if already downloaded
+        _ = try downloadData(url: url, recordId: recordId)
+    }
+
+    private func downloadData(url: URL, recordId: String) throws -> Data {
+        let filename = url.lastPathComponent
+
         if FileManager.default.fileExists(atPath: url.path), case .current = downloadState(for: url) {
-            return
+            Log.info("downloadFile: \(filename) already current on local URL")
+            return try coordinatedRead(from: url)
         }
 
         let deadline = Date().addingTimeInterval(defaultTimeout)
-        let filename = url.lastPathComponent
 
         let resolvedItem: ResolvedMetadataItem
         do {
@@ -461,73 +492,96 @@ final class ICloudDriveHelper: @unchecked Sendable {
                 deadline: deadline
             )
         } catch {
-            throw CloudStorageError.DownloadFailed(
-                "iCloud metadata lookup failed for \(filename): \(error.localizedDescription)"
-            )
+            throw Self.downloadError("iCloud metadata lookup failed for \(filename)", error: error)
         }
 
         if resolvedItem.url != url {
             Log.info(
-                "ensureDownloaded: using metadata URL for \(filename) local=\(url.path) metadata=\(resolvedItem.url.path)"
+                "downloadFile: using metadata URL for \(filename) local=\(url.path) metadata=\(resolvedItem.url.path)"
             )
+        } else {
+            Log.info("downloadFile: \(filename) reading via resolved local URL")
         }
 
-        // trigger download via startDownloadingUbiquitousItem
-        do {
-            try FileManager.default.startDownloadingUbiquitousItem(at: resolvedItem.url)
-        } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSCocoaErrorDomain,
-               nsError.code == NSFileReadNoSuchFileError || nsError.code == 4
-            {
-                throw CloudStorageError.NotFound(recordId)
-            }
-            Log.warn("ensureDownloaded: startDownloading failed for \(filename): \(error.localizedDescription)")
-        }
+        try triggerDownload(url: resolvedItem.url, recordId: recordId, filename: filename)
 
-        // poll with periodic re-triggers — the iCloud daemon can silently
-        // drop the first request on fresh installs before it's fully ready
+        // poll with periodic re-triggers and inline coordinated reads because
+        // some restored-device placeholders never transition out of
+        // not-downloaded even though they can be materialized
         let retriggerInterval: TimeInterval = 5
         var lastRetrigger = Date()
         var lastProgressLog = Date.distantPast
+        var coordinatedReadAttempt = 0
+        var lastCoordinatedReadError: Error?
 
         while Date() < deadline {
             let now = Date()
+            let state = downloadState(for: resolvedItem.url)
 
             if now.timeIntervalSince(lastRetrigger) >= retriggerInterval {
-                try? FileManager.default.startDownloadingUbiquitousItem(at: resolvedItem.url)
+                try? triggerDownload(url: resolvedItem.url, recordId: recordId, filename: filename)
                 lastRetrigger = now
-            }
+                coordinatedReadAttempt += 1
 
-            let state = downloadState(for: resolvedItem.url)
+                Log.info(
+                    "downloadFile: trying coordinated read attempt=\(coordinatedReadAttempt) reason=retry file=\(filename)"
+                )
+
+                do {
+                    let data = try coordinatedRead(from: resolvedItem.url)
+                    Log.info("downloadFile: coordinated read succeeded for \(filename)")
+                    return data
+                } catch {
+                    lastCoordinatedReadError = error
+                    Log.warn(
+                        "downloadFile: coordinated read failed attempt=\(coordinatedReadAttempt) file=\(filename): \(error.localizedDescription)"
+                    )
+                }
+            }
 
             if now.timeIntervalSince(lastProgressLog) >= progressLogInterval {
                 Log.info(
-                    "ensureDownloaded: \(filename) state=\(state) metadataPath=\(resolvedItem.metadataPath ?? "<unknown>")"
+                    "downloadFile: \(filename) state=\(state) metadataPath=\(resolvedItem.metadataPath ?? "<unknown>")"
                 )
                 lastProgressLog = now
             }
 
-            if case .current = state { return }
+            if case .current = state {
+                Log.info("downloadFile: poll path won for \(filename)")
+                return try coordinatedRead(from: resolvedItem.url)
+            }
 
             if case let .failed(error) = state {
-                throw CloudStorageError.DownloadFailed(
-                    "iCloud download failed: \(error.localizedDescription)"
-                )
+                throw Self.downloadError("iCloud download failed", error: error)
             }
 
             Thread.sleep(forTimeInterval: pollInterval)
         }
 
-        // last resort: try coordinated read which forces download
-        Log.info("ensureDownloaded: polling timed out, trying coordinated read for \(filename)")
+        Log.info("downloadFile: polling timed out, trying final coordinated read for \(filename)")
         do {
-            _ = try coordinatedRead(from: resolvedItem.url)
-            return
+            return try coordinatedRead(from: resolvedItem.url)
         } catch {
-            throw CloudStorageError.DownloadFailed(
-                "iCloud download timed out after \(defaultTimeout)s (coordinated read also failed: \(error.localizedDescription))"
+            let diagnosticError = lastCoordinatedReadError?.localizedDescription ?? "none"
+            throw CloudStorageError.Offline(
+                "iCloud download timed out after \(defaultTimeout)s (last coordinated read error: \(diagnosticError), final coordinated read failed: \(error.localizedDescription))"
             )
+        }
+    }
+
+    private func triggerDownload(url: URL, recordId: String, filename: String) throws {
+        do {
+            try FileManager.default.startDownloadingUbiquitousItem(at: url)
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain,
+               nsError.code == NSFileReadNoSuchFileError
+               // some iCloud missing-file cases surface as legacy Cocoa code 4
+               || nsError.code == Self.legacyFileReadNoSuchFileError
+            {
+                throw CloudStorageError.NotFound(recordId)
+            }
+            Log.warn("downloadFile: startDownloading failed for \(filename): \(error.localizedDescription)")
         }
     }
 
@@ -583,8 +637,11 @@ final class ICloudDriveHelper: @unchecked Sendable {
     }
 
     private func downloadState(for url: URL) -> DownloadState {
+        var freshURL = url
+        freshURL.removeAllCachedResourceValues()
+
         guard
-            let values = try? url.resourceValues(forKeys: [
+            let values = try? freshURL.resourceValues(forKeys: [
                 .isUbiquitousItemKey,
                 .ubiquitousItemIsDownloadingKey,
                 .ubiquitousItemDownloadingStatusKey,
@@ -722,12 +779,13 @@ final class ICloudDriveHelper: @unchecked Sendable {
     private static func isNoSuchFileError(_ error: Error) -> Bool {
         let nsError = error as NSError
         guard nsError.domain == NSCocoaErrorDomain else { return false }
-        return nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError
-            || nsError.code == 4
+        return nsError.code == NSFileNoSuchFileError
+            || nsError.code == NSFileReadNoSuchFileError
+            || nsError.code == Self.legacyFileReadNoSuchFileError
     }
 
     /// Checks sync health of all files in namespace directories
-    func overallSyncHealth() -> SyncHealth {
+    func overallSyncHealth() -> CloudSyncHealth {
         guard let namespacesRoot = try? namespacesRootURL() else { return .unavailable }
 
         guard
@@ -771,13 +829,5 @@ final class ICloudDriveHelper: @unchecked Sendable {
         if anyFailed { return .failed(failureMessage ?? "upload error") }
         if allUploaded { return .allUploaded }
         return .uploading
-    }
-
-    enum SyncHealth {
-        case allUploaded
-        case uploading
-        case failed(String)
-        case noFiles
-        case unavailable
     }
 }

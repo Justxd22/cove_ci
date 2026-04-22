@@ -12,7 +12,6 @@ final class OnboardingManager: AnyReconciler, OnboardingManagerReconciler, @unch
     let app: AppManager
     var state: OnboardingState
     var isComplete = false
-    var cloudCheckWarning: String?
 
     typealias Message = OnboardingReconcileMessage
 
@@ -35,17 +34,21 @@ final class OnboardingManager: AnyReconciler, OnboardingManagerReconciler, @unch
             guard let self else { return }
             switch message {
             case let .step(step):
-                applyStep(step)
+                state.step = step
             case let .branch(branch):
                 state.branch = branch
-            case let .hardwareDevice(device):
-                state.hardwareDevice = device
             case let .createdWords(words):
                 state.createdWords = words
             case let .cloudBackupEnabled(enabled):
                 state.cloudBackupEnabled = enabled
             case let .secretWordsSaved(saved):
                 state.secretWordsSaved = saved
+            case let .cloudRestoreState(cloudRestoreState):
+                state.cloudRestoreState = cloudRestoreState
+            case let .cloudRestoreMessageChanged(cloudRestoreMessage):
+                state.cloudRestoreMessage = cloudRestoreMessage
+            case let .shouldOfferCloudRestore(shouldOfferCloudRestore):
+                state.shouldOfferCloudRestore = shouldOfferCloudRestore
             case let .errorMessageChanged(errorMessage):
                 state.errorMessage = errorMessage
             case .complete:
@@ -56,15 +59,5 @@ final class OnboardingManager: AnyReconciler, OnboardingManagerReconciler, @unch
 
     func reconcileMany(messages: [OnboardingReconcileMessage]) {
         messages.forEach { reconcile(message: $0) }
-    }
-
-    private func applyStep(_ step: OnboardingStep) {
-        if state.step == .cloudCheck, step == .restoreOffer {
-            cloudCheckWarning = state.errorMessage
-        } else if step != .restoreOffer {
-            cloudCheckWarning = nil
-        }
-
-        state.step = step
     }
 }

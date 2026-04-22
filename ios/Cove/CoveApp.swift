@@ -5,7 +5,6 @@
 //  Created by Praveen Perera  on 6/17/24.
 //
 
-@_exported import CoveCore
 import MijickPopups
 import SwiftUI
 
@@ -39,7 +38,7 @@ struct CoveApp: App {
     enum StartupState {
         case loading
         case ready(AppManager, AuthManager)
-        case onboarding(AppManager, AuthManager)
+        case onboarding(AppManager, AuthManager, OnboardingManager)
         case catastrophicError
         case fatalError(String)
     }
@@ -51,6 +50,7 @@ struct CoveApp: App {
     init() {
         _ = Keychain(keychain: KeychainAccessor())
         _ = Device(device: DeviceAccesor())
+        _ = Connectivity(connectivity: CloudConnectivityMonitor.shared)
         _ = PasskeyAccess(provider: PasskeyProviderImpl())
         _ = CloudStorage(cloudStorage: CloudStorageAccessImpl())
         Self.excludeDataDirFromBackup(logFailure: false)
@@ -111,8 +111,8 @@ extension CoveApp {
             CoverView(errorMessage: nil)
         case let .ready(app, auth):
             CoveMainView(app: app, auth: auth)
-        case let .onboarding(app, auth):
-            OnboardingContainer(manager: OnboardingManager(app: app)) {
+        case let .onboarding(app, auth, manager):
+            OnboardingContainer(manager: manager, auth: auth) {
                 startupState = .ready(app, auth)
                 startBackupIntegrityCheck()
             }
@@ -232,6 +232,7 @@ extension CoveApp {
         Self.excludeDataDirFromBackup(logFailure: true)
         let appManager = AppManager.shared
         appManager.asyncRuntimeReady = true
+        CloudConnectivityMonitor.shared.start()
         CloudBackupManager.shared.rust.syncPersistedState()
         self.bdkMigrationWarning = warning
         startInitData(appManager)
@@ -241,7 +242,11 @@ extension CoveApp {
 
         if needsOnboarding {
             Log.info("[STARTUP] entering onboarding flow")
-            self.startupState = .onboarding(appManager, AuthManager.shared)
+            self.startupState = .onboarding(
+                appManager,
+                AuthManager.shared,
+                OnboardingManager(app: appManager)
+            )
         } else {
             Log.info("[STARTUP] going to ready state")
             self.startupState = .ready(appManager, AuthManager.shared)
@@ -284,9 +289,7 @@ extension CoveApp {
             let isICloudAvailable = await MainActor.run { FileManager.default.ubiquityIdentityToken != nil }
             guard isICloudAvailable else { return }
 
-            let warning = await Task.detached {
-                CloudBackupManager.shared.rust.verifyBackupIntegrity()
-            }.value
+            let warning = await CloudBackupManager.shared.rust.verifyBackupIntegrity()
             if let warning { Log.error("[STARTUP] backup integrity warning: \(warning)") }
         }
     }

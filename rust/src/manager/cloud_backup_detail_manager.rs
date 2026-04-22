@@ -2,7 +2,7 @@ use act_zero::send;
 use tracing::error;
 
 use super::cloud_backup_manager::{
-    CLOUD_BACKUP_MANAGER, CloudBackupError, CloudBackupManagerAction, CloudBackupReconcileMessage,
+    CLOUD_BACKUP_MANAGER, CloudBackupError, CloudBackupManagerAction, CloudBackupPasskeyChoiceFlow,
     CloudBackupWalletItem, DeepVerificationFailure, DeepVerificationReport, DeepVerificationResult,
     RustCloudBackupManager, runtime_actor::CloudBackupOperation,
 };
@@ -61,12 +61,24 @@ impl RustCloudBackupManager {
     #[uniffi::method]
     pub fn dispatch(&self, action: Action) {
         match action {
-            Action::EnableCloudBackup => self.enable_cloud_backup(),
-            Action::EnableCloudBackupForceNew => self.enable_cloud_backup_force_new(),
-            Action::EnableCloudBackupNoDiscovery => self.enable_cloud_backup_no_discovery(),
+            Action::EnableCloudBackup => {
+                self.clear_passkey_choice_prompt();
+                self.enable_cloud_backup();
+            }
+            Action::EnableCloudBackupForceNew => {
+                self.clear_existing_backup_found_prompt();
+                self.enable_cloud_backup_force_new();
+            }
+            Action::EnableCloudBackupNoDiscovery => {
+                self.clear_existing_backup_found_prompt();
+                self.clear_passkey_choice_prompt();
+                self.enable_cloud_backup_no_discovery();
+            }
             Action::DiscardPendingEnableCloudBackup => {
                 self.discard_pending_enable_cloud_backup();
             }
+            Action::DismissPasskeyChoicePrompt => self.clear_passkey_choice_prompt(),
+            Action::DismissMissingPasskeyReminder => self.dismiss_missing_passkey_prompt(),
             Action::RestoreFromCloudBackup => self.restore_from_cloud_backup(),
             Action::CancelRestore => self.cancel_restore(),
             Action::StartVerification => self.start_verification(),
@@ -79,9 +91,11 @@ impl RustCloudBackupManager {
                 CLOUD_BACKUP_MANAGER.clone().spawn_recovery(RecoveryAction::ReinitializeBackup);
             }
             Action::RepairPasskey => {
+                self.clear_passkey_choice_prompt();
                 CLOUD_BACKUP_MANAGER.clone().spawn_repair_passkey(false);
             }
             Action::RepairPasskeyNoDiscovery => {
+                self.clear_passkey_choice_prompt();
                 CLOUD_BACKUP_MANAGER.clone().spawn_repair_passkey(true);
             }
             Action::SyncUnsynced => CLOUD_BACKUP_MANAGER.clone().spawn_sync(),
@@ -155,11 +169,11 @@ impl RustCloudBackupManager {
         send!(self.runtime.start_operation(CloudBackupOperation::RefreshDetail, None));
     }
 
-    pub(crate) fn handle_start_verification(&self, force_discoverable: bool) {
+    pub(crate) async fn handle_start_verification(&self, force_discoverable: bool) {
         self.clear_pending_verification_completion();
         self.set_verification(VerificationState::Verifying);
 
-        let result = self.deep_verify_cloud_backup(force_discoverable);
+        let result = self.deep_verify_cloud_backup(force_discoverable).await;
 
         match result {
             DeepVerificationResult::Verified(report) => {
@@ -199,19 +213,30 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_recovery(&self, action: RecoveryAction) {
+    pub(crate) async fn handle_recovery(&self, action: RecoveryAction) {
         self.set_recovery(RecoveryState::Recovering(action.clone()));
 
         let result = match &action {
-            RecoveryAction::RecreateManifest => self.do_reupload_all_wallets(),
-            RecoveryAction::ReinitializeBackup => self.do_enable_cloud_backup(),
-            RecoveryAction::RepairPasskey => self.do_repair_passkey_wrapper(),
+            RecoveryAction::RecreateManifest => self.do_reupload_all_wallets().await,
+            RecoveryAction::ReinitializeBackup => self.run_reinitialize_backup().await,
+            RecoveryAction::RepairPasskey => self.do_repair_passkey_wrapper().await,
+        };
+        let should_auto_verify = match action {
+            RecoveryAction::ReinitializeBackup => {
+                matches!(
+                    self.current_status(),
+                    super::cloud_backup_manager::CloudBackupStatus::Enabled
+                )
+            }
+            RecoveryAction::RecreateManifest | RecoveryAction::RepairPasskey => true,
         };
 
         match result {
             Ok(()) => {
                 self.set_recovery(RecoveryState::Idle);
-                self.handle_start_verification(false);
+                if should_auto_verify {
+                    self.handle_start_verification(false).await;
+                }
             }
             Err(CloudBackupError::UnsupportedPasskeyProvider) => {
                 self.set_recovery(RecoveryState::Idle);
@@ -225,18 +250,18 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_repair_passkey(&self, no_discovery: bool) {
+    pub(crate) async fn handle_repair_passkey(&self, no_discovery: bool) {
         self.set_recovery(RecoveryState::Recovering(RecoveryAction::RepairPasskey));
 
         let result = if no_discovery {
-            self.do_repair_passkey_wrapper_no_discovery()
+            self.do_repair_passkey_wrapper_no_discovery().await
         } else {
-            self.do_repair_passkey_wrapper()
+            self.do_repair_passkey_wrapper().await
         };
 
         match result {
             Ok(()) => {
-                if let Err(error) = self.finalize_passkey_repair() {
+                if let Err(error) = self.finalize_passkey_repair().await {
                     self.set_recovery(RecoveryState::Failed {
                         action: RecoveryAction::RepairPasskey,
                         error: error.to_string(),
@@ -249,7 +274,7 @@ impl RustCloudBackupManager {
             }
             Err(CloudBackupError::PasskeyDiscoveryCancelled) => {
                 self.set_recovery(RecoveryState::Idle);
-                self.send(CloudBackupReconcileMessage::PasskeyDiscoveryCancelled);
+                self.set_passkey_choice_prompt(CloudBackupPasskeyChoiceFlow::RepairPasskey);
             }
             Err(CloudBackupError::UnsupportedPasskeyProvider) => {
                 self.set_recovery(RecoveryState::Idle);
@@ -266,12 +291,34 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_sync(&self) {
+    async fn run_reinitialize_backup(&self) -> Result<(), CloudBackupError> {
+        if !self.begin_background_operation(
+            "reinitialize_cloud_backup",
+            Some(super::cloud_backup_manager::CloudBackupStatus::Enabling),
+        ) {
+            return Err(CloudBackupError::RecoveryRequired(
+                "cloud backup operation already running".into(),
+            ));
+        }
+
+        let result = self.do_enable_cloud_backup().await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.set_status(RustCloudBackupManager::runtime_status_for(
+                    &RustCloudBackupManager::load_persisted_state(),
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn handle_sync(&self) {
         self.set_sync(SyncState::Syncing);
 
-        match self.do_sync_unsynced_wallets() {
+        match self.do_sync_unsynced_wallets().await {
             Ok(()) => {
-                self.handle_refresh_detail();
+                self.handle_refresh_detail().await;
                 self.set_sync(SyncState::Idle);
             }
             Err(error) => {
@@ -280,11 +327,11 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_fetch_cloud_only(&self) {
+    pub(crate) async fn handle_fetch_cloud_only(&self) {
         self.set_cloud_only(CloudOnlyState::Loading);
         self.set_cloud_only_operation(CloudOnlyOperation::Idle);
 
-        match self.do_fetch_cloud_only_wallets() {
+        match self.do_fetch_cloud_only_wallets().await {
             Ok(items) => {
                 self.set_cloud_only(CloudOnlyState::Loaded { wallets: items });
             }
@@ -295,12 +342,12 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_restore_cloud_wallet(&self, record_id: &str) {
+    pub(crate) async fn handle_restore_cloud_wallet(&self, record_id: &str) {
         self.set_cloud_only_operation(CloudOnlyOperation::Operating {
             record_id: record_id.to_string(),
         });
 
-        match self.do_restore_cloud_wallet(record_id) {
+        match self.do_restore_cloud_wallet(record_id).await {
             Ok(outcome) => {
                 if let Some(warning) = outcome.labels_warning {
                     self.set_cloud_only_operation(CloudOnlyOperation::Warning {
@@ -319,7 +366,7 @@ impl RustCloudBackupManager {
                     wallets.retain(|wallet| wallet.record_id != record_id);
                 }
                 self.set_cloud_only(cloud_only);
-                self.handle_refresh_detail();
+                self.handle_refresh_detail().await;
             }
             Err(error) => {
                 self.set_cloud_only_operation(CloudOnlyOperation::Failed {
@@ -329,12 +376,12 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_delete_cloud_wallet(&self, record_id: &str) {
+    pub(crate) async fn handle_delete_cloud_wallet(&self, record_id: &str) {
         self.set_cloud_only_operation(CloudOnlyOperation::Operating {
             record_id: record_id.to_string(),
         });
 
-        match self.do_delete_cloud_wallet(record_id) {
+        match self.do_delete_cloud_wallet(record_id).await {
             Ok(()) => {
                 self.set_cloud_only_operation(CloudOnlyOperation::Idle);
 
@@ -343,7 +390,7 @@ impl RustCloudBackupManager {
                     wallets.retain(|wallet| wallet.record_id != record_id);
                 }
                 self.set_cloud_only(cloud_only);
-                self.handle_refresh_detail();
+                self.handle_refresh_detail().await;
             }
             Err(error) => {
                 self.set_cloud_only_operation(CloudOnlyOperation::Failed {
@@ -353,8 +400,9 @@ impl RustCloudBackupManager {
         }
     }
 
-    pub(crate) fn handle_refresh_detail(&self) {
-        if let Some(result) = self.refresh_cloud_backup_detail() {
+    pub(crate) async fn handle_refresh_detail(&self) {
+        self.refresh_sync_health();
+        if let Some(result) = self.refresh_cloud_backup_detail().await {
             match result {
                 super::cloud_backup_manager::CloudBackupDetailResult::Success(detail) => {
                     self.set_detail(Some(detail));
