@@ -239,10 +239,6 @@ struct NetworkSettingsView: View {
                     Text("Status: \(uiState.currentStep)")
                         .font(.subheadline)
 
-                    Text("Log: \(uiState.latestLogLine)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
                     Button("Test connection") {
                         Task { await runProgressiveTorTest() }
                     }
@@ -445,7 +441,14 @@ struct NetworkSettingsView: View {
             return
         }
 
-        try? globalConfig.setUseTor(useTor: true)
+        do {
+            try globalConfig.setUseTor(useTor: true)
+        } catch {
+            noticeMessage = "Could not enable Tor: \(error.localizedDescription)"
+            appendTorLog("Failed to enable Tor: \(error.localizedDescription)")
+            return
+        }
+
         uiState.enabled = true
         uiState.status = .bootstrapping
         uiState.currentStep = "Preparing Tor"
@@ -457,7 +460,14 @@ struct NetworkSettingsView: View {
     }
 
     private func setTorMode(_ mode: TorMode) {
-        try? globalConfig.set(key: .torMode, value: mode.persistedValue)
+        do {
+            try globalConfig.set(key: .torMode, value: mode.persistedValue)
+        } catch {
+            noticeMessage = "Could not save Tor mode: \(error.localizedDescription)"
+            appendTorLog("Failed to save Tor mode: \(error.localizedDescription)")
+            return
+        }
+
         app.pendingNodeTorValidated = false
         autoPendingTestKey = nil
         uiState.mode = mode
@@ -481,17 +491,32 @@ struct NetworkSettingsView: View {
             return
         }
 
-        try? globalConfig.set(key: .torExternalHost, value: uiState.externalHost)
-        if let port = UInt16(uiState.externalPort) {
-            try? globalConfig.setTorExternalPort(port: port)
+        do {
+            try globalConfig.set(key: .torExternalHost, value: uiState.externalHost)
+            if let port = UInt16(uiState.externalPort) {
+                try globalConfig.setTorExternalPort(port: port)
+            }
+        } catch {
+            noticeMessage = "Could not save Tor proxy configuration: \(error.localizedDescription)"
+            appendTorLog("Failed to save external Tor config: \(error.localizedDescription)")
+            return
         }
+
         app.pendingNodeTorValidated = false
-        appendTorLog("Saved external Tor config: \(uiState.externalHost):\(uiState.externalPort)")
+        let proxyLog = redactedProxyForLog(host: uiState.externalHost, port: Int(uiState.externalPort) ?? 0)
+        appendTorLog("Saved external Tor config: \(proxyLog)")
         noticeMessage = "Tor proxy configuration saved."
     }
 
     private func disableTorState() {
-        try? globalConfig.setUseTor(useTor: false)
+        do {
+            try globalConfig.setUseTor(useTor: false)
+        } catch {
+            noticeMessage = "Could not disable Tor: \(error.localizedDescription)"
+            appendTorLog("Failed to disable Tor: \(error.localizedDescription)")
+            return
+        }
+
         uiState.enabled = false
         uiState.status = .disabled
         uiState.progressPercent = 0
@@ -504,7 +529,7 @@ struct NetworkSettingsView: View {
         if isOnionNodeUrl(app.selectedNode.url) {
             do {
                 let fallback = try await switchToFirstClearnetPresetNode(nodeSelector)
-                appendTorLog("Switched active node to \(fallback.url) before disabling Tor")
+                appendTorLog("Switched active node to \(redactedNodeForLog(fallback)) before disabling Tor")
                 noticeMessage = "Switched to \(fallback.name) and disabled Tor."
             } catch {
                 appendTorLog("Unable to disable Tor: clearnet fallback failed (\(error.localizedDescription))")
@@ -554,10 +579,38 @@ struct NetworkSettingsView: View {
         }
 
         let snapshot = deriveBuiltInBootstrapSnapshot(rustLogs)
-        uiState.progressPercent = snapshot.percent
-        uiState.currentStep = snapshot.step
+        let structuredStatus = builtInTorBootstrapStatus()
+        let hasStructuredStatus = structuredStatus.launched
+        let nextStatus: TorStatus = if structuredStatus.ready {
+            .ready
+        } else if structuredStatus.lastError != nil {
+            .error
+        } else if hasStructuredStatus {
+            .bootstrapping
+        } else if snapshot.isReady {
+            .ready
+        } else if snapshot.hasError {
+            .error
+        } else {
+            .bootstrapping
+        }
+        let snapshotPercent = hasStructuredStatus ? max(Int(structuredStatus.percent), snapshot.percent) : snapshot.percent
+        if nextStatus == .ready {
+            uiState.progressPercent = 100
+        } else if nextStatus == .bootstrapping, uiState.status == .bootstrapping {
+            uiState.progressPercent = max(uiState.progressPercent, snapshotPercent)
+        } else {
+            uiState.progressPercent = snapshotPercent
+        }
+        uiState.currentStep =
+            (
+                structuredStatus.lastError
+                    ?? structuredStatus.blocked.map { "Blocked: \($0)" }
+                    ?? (hasStructuredStatus && !structuredStatus.message.isEmpty ? structuredStatus.message : snapshot.step)
+            )
+            .replacingOccurrences(of: #"^\d{1,3}%:\s*"#, with: "", options: .regularExpression)
         uiState.latestLogLine = snapshot.lastLine
-        uiState.status = snapshot.isReady ? .ready : snapshot.hasError ? .error : .bootstrapping
+        uiState.status = nextStatus
     }
 
     private func ensureBuiltInWarmup() async {
@@ -611,7 +664,8 @@ struct NetworkSettingsView: View {
             uiState.status = validationError == nil ? .bootstrapping : .error
             uiState.progressPercent = validationError == nil ? 50 : 0
             uiState.currentStep = validationError == nil ? "Save and test custom proxy" : "External proxy config invalid"
-            uiState.latestLogLine = validationError ?? "\(uiState.externalHost):\(uiState.externalPort)"
+            uiState.latestLogLine = validationError
+                ?? redactedProxyForLog(host: uiState.externalHost, port: Int(uiState.externalPort) ?? 0)
         case .orbot:
             uiState.status = uiState.orbotStatus == .detected ? .bootstrapping : .error
             uiState.progressPercent = uiState.orbotStatus == .detected ? 50 : 0
@@ -624,13 +678,14 @@ struct NetworkSettingsView: View {
 
     private func testTorProxy(host: String, port: Int) async -> Result<Void, Error> {
         syncRustTorLogs()
-        appendTorLog("Testing SOCKS endpoint \(host):\(port)")
+        let proxyLog = redactedProxyForLog(host: host, port: port)
+        appendTorLog("Testing SOCKS endpoint \(proxyLog)")
         let result = await testSocksEndpoint(host: host, port: port)
         switch result {
         case .success:
-            appendTorLog("SOCKS endpoint reachable: \(host):\(port)")
+            appendTorLog("SOCKS endpoint reachable: \(proxyLog)")
         case let .failure(error):
-            appendTorLog("SOCKS endpoint failed: \(host):\(port) (\(error.localizedDescription))")
+            appendTorLog("SOCKS endpoint failed: \(proxyLog) (\(error.localizedDescription))")
         }
         syncRustTorLogs()
         return result
@@ -644,24 +699,25 @@ struct NetworkSettingsView: View {
                 name: typeName,
                 enteredName: app.pendingNodeName
             )
-            appendTorLog("Using pending node for Tor test: \(app.pendingNodeUrl)")
+            appendTorLog("Using pending node for Tor test: \(redactedNodeForLog(node))")
             return node
         }
 
-        appendTorLog("Using selected node for Tor test: \(app.selectedNode.url)")
+        appendTorLog("Using selected node for Tor test: \(redactedNodeForLog(app.selectedNode))")
         return app.selectedNode
     }
 
     private func runNodeTorTest(_ node: Node) async -> Result<Void, Error> {
         syncRustTorLogs()
-        appendTorLog("Checking node via Tor: \(node.url)")
+        let nodeLog = redactedNodeForLog(node)
+        appendTorLog("Checking node via Tor: \(nodeLog)")
         do {
             try await nodeSelector.checkSelectedNode(node: node)
-            appendTorLog("Node check passed: \(node.url)")
+            appendTorLog("Node check passed: \(nodeLog)")
             syncRustTorLogs()
             return .success(())
         } catch {
-            appendTorLog("Node check failed: \(node.url) (\(error.localizedDescription))")
+            appendTorLog("Node check failed: \(nodeLog) (\(error.localizedDescription))")
             syncRustTorLogs()
             return .failure(error)
         }
@@ -681,7 +737,7 @@ struct NetworkSettingsView: View {
 
     private func runTorApiTestWithRetries(host: String, port: Int) async -> Result<TorApiSnapshot, Error> {
         let maxAttempts = 5
-        var timeout: TimeInterval = 8
+        var timeout: TimeInterval = 15
         var lastError: Error?
 
         for attempt in 1 ... maxAttempts {
@@ -707,6 +763,18 @@ struct NetworkSettingsView: View {
         }
 
         return .failure(lastError ?? TorSupportError.timeout)
+    }
+
+    private func persistTorTestConfiguration(host: String, port: Int) throws {
+        try globalConfig.set(key: .torMode, value: uiState.mode.persistedValue)
+        if uiState.mode == .external {
+            guard let port = UInt16(exactly: port) else {
+                throw TorSupportError.invalidEndpoint
+            }
+            try globalConfig.set(key: .torExternalHost, value: host)
+            try globalConfig.setTorExternalPort(port: port)
+        }
+        try globalConfig.setUseTor(useTor: true)
     }
 
     private func runProgressiveTorTest() async {
@@ -735,24 +803,29 @@ struct NetworkSettingsView: View {
         }
 
         let (host, port) = endpoint
+        let proxyLog = redactedProxyForLog(host: host, port: port)
+
+        do {
+            try persistTorTestConfiguration(host: host, port: port)
+        } catch {
+            app.pendingNodeTorValidated = false
+            uiState.status = .error
+            appendTorLog("Failed to save Tor settings before test: \(error.localizedDescription)")
+            noticeMessage = "Could not save Tor settings: \(error.localizedDescription)"
+            return
+        }
+
         showTorTestSheet = true
         torTestState = TorConnectionTestState(
             running: true,
             finished: false,
             steps: [
-                TorTestStep(key: "proxy", title: "Tor proxy reachable", detail: "Checking SOCKS endpoint \(host):\(port)"),
+                TorTestStep(key: "proxy", title: "Tor proxy reachable", detail: "Checking SOCKS endpoint \(proxyLog)"),
                 TorTestStep(key: "api", title: "Tor API reports Tor exit", detail: "Checking torproject API over SOCKS"),
                 TorTestStep(key: "node", title: "Node reachable via Tor", detail: "Checking selected node over Tor"),
             ],
             logs: ["Starting Tor connection test (\(uiState.mode.shortTitle))"]
         )
-
-        try? globalConfig.setUseTor(useTor: true)
-        try? globalConfig.set(key: .torMode, value: uiState.mode.persistedValue)
-        if uiState.mode == .external {
-            try? globalConfig.set(key: .torExternalHost, value: host)
-            try? globalConfig.setTorExternalPort(port: UInt16(port))
-        }
 
         updateTorTestStep("proxy", status: .running)
         let proxyResult = await testTorProxy(host: host, port: port)

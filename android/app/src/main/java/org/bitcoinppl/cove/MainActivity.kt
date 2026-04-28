@@ -80,6 +80,7 @@ import org.bitcoinppl.cove.navigation.CoveNavDisplay
 import org.bitcoinppl.cove.nfc.NfcScanSheet
 import org.bitcoinppl.cove.nfc.TapCardNfcManager
 import org.bitcoinppl.cove.sidebar.SidebarContainer
+import org.bitcoinppl.cove.tor.parseCoreTorMode
 import org.bitcoinppl.cove.tor.testSocksEndpoint
 import org.bitcoinppl.cove.ui.theme.CoveTheme
 import org.bitcoinppl.cove.views.LockView
@@ -353,19 +354,18 @@ class MainActivity : FragmentActivity() {
                     return@LaunchedEffect
                 }
 
-                val mode =
-                    runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull()
-                        ?: TorMode.BUILT_IN.name
+                val mode = parseCoreTorMode(runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull())
 
                 when (mode) {
-                    TorMode.ORBOT.name -> {
+                    TorMode.BUILT_IN -> Unit
+                    TorMode.ORBOT -> {
                         val reachable = testSocksEndpoint("127.0.0.1", 9050, 1500).isSuccess
                         if (!reachable) {
                             startupTorUnavailableMode = TorMode.ORBOT
                             startupTorUnavailableEndpoint = "127.0.0.1:9050"
                         }
                     }
-                    TorMode.EXTERNAL.name -> {
+                    TorMode.EXTERNAL -> {
                         val host =
                             runCatching { globalConfig.get(GlobalConfigKey.TorExternalHost) }
                                 .getOrNull()

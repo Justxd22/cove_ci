@@ -556,7 +556,7 @@ struct CoveMainView: View {
 
         let endpointDescription = "\(endpoint.host):\(endpoint.port)"
         let signature = "\(mode.persistedValue)|\(endpointDescription)|\(app.selectedNode.url)"
-        guard startupTorCheckSignature != signature else { return }
+        guard startupTorCheckSignature != signature || startupTorUnavailable != nil else { return }
         startupTorCheckSignature = signature
 
         let result = await testSocksEndpoint(host: endpoint.host, port: endpoint.port, timeout: 2)
@@ -604,7 +604,16 @@ struct CoveMainView: View {
     private func openOrbotFromStartupWarning() {
         startupTorUnavailable = nil
         guard let url = URL(string: "orbot://") else { return }
-        UIApplication.shared.open(url)
+        UIApplication.shared.open(url, options: [:]) { success in
+            if !success {
+                app.alertState = .init(
+                    .general(
+                        title: "Unable to open Orbot",
+                        message: "Open Orbot manually, then return to Cove and retry Tor."
+                    )
+                )
+            }
+        }
     }
 
     var body: some View {

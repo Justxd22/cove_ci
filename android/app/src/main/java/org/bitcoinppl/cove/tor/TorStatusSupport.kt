@@ -3,6 +3,7 @@ package org.bitcoinppl.cove.tor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
@@ -25,6 +26,10 @@ data class TorApiSnapshot(
 private val bootstrapPercentRegex = Regex("""\b(100|[0-9]{1,2})%\b""")
 private val missingCountRegex = Regex("""missing\s+(\d+)""")
 private val missingFractionRegex = Regex("""missing\s+(\d+)\s*/\s*(\d+)""")
+private val torApiBooleanRegex =
+    Regex(""""is_?tor"\s*:\s*true""", RegexOption.IGNORE_CASE)
+private val torApiIpRegex =
+    Regex(""""ip"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
 
 private fun isRustTorLog(line: String): Boolean {
     val trimmed = line.trim()
@@ -226,7 +231,7 @@ suspend fun testSocksEndpoint(
 suspend fun testTorApiThroughSocks(
     host: String,
     port: Int,
-    timeoutMs: Int = 8000,
+    timeoutMs: Int = 15000,
 ): Result<TorApiSnapshot> =
     try {
         val snapshot =
@@ -240,9 +245,14 @@ suspend fun testTorApiThroughSocks(
                     connection.getInputStream().bufferedReader().use { reader ->
                         reader.readText()
                     }
-                val normalized = raw.lowercase()
-                val isTor = "\"istor\":true" in normalized || "\"is_tor\":true" in normalized
-                val ip = Regex(""""IP"\s*:\s*"([^"]+)"""").find(raw)?.groupValues?.getOrNull(1)
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                val isTor =
+                    json?.caseInsensitiveBoolean("IsTor")
+                        ?: json?.caseInsensitiveBoolean("is_tor")
+                        ?: torApiBooleanRegex.containsMatchIn(raw)
+                val ip =
+                    json?.caseInsensitiveString("IP")
+                        ?: torApiIpRegex.find(raw)?.groupValues?.getOrNull(1)
 
                 TorApiSnapshot(isTor = isTor, ip = ip, raw = raw)
             }
@@ -252,3 +262,13 @@ suspend fun testTorApiThroughSocks(
     } catch (error: Exception) {
         Result.failure(error)
     }
+
+private fun JSONObject.caseInsensitiveBoolean(key: String): Boolean? {
+    val actualKey = keys().asSequence().firstOrNull { it.equals(key, ignoreCase = true) }
+    return actualKey?.let { optBoolean(it) }
+}
+
+private fun JSONObject.caseInsensitiveString(key: String): String? {
+    val actualKey = keys().asSequence().firstOrNull { it.equals(key, ignoreCase = true) }
+    return actualKey?.let { optString(it).takeIf(String::isNotEmpty) }
+}

@@ -106,6 +106,16 @@ pub enum TorBootstrapError {
     BuiltInTor(String),
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BuiltInTorBootstrapStatus {
+    pub percent: u32,
+    pub ready: bool,
+    pub blocked: Option<String>,
+    pub message: String,
+    pub launched: bool,
+    pub last_error: Option<String>,
+}
+
 /// set root data directory before any database access
 /// required for Android to specify app-specific storage path
 #[uniffi::export]
@@ -124,6 +134,11 @@ async fn ensure_built_in_tor_bootstrap() -> Result<String, TorBootstrapError> {
 #[uniffi::export]
 fn tor_connection_logs() -> Vec<String> {
     logging::tor_connection_logs()
+}
+
+#[uniffi::export]
+fn built_in_tor_bootstrap_status() -> BuiltInTorBootstrapStatus {
+    tor_runtime::built_in_bootstrap_status()
 }
 
 #[uniffi::export]

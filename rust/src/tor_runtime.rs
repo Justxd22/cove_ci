@@ -3,23 +3,25 @@ use std::{
     path::PathBuf,
 };
 
+use futures::{FutureExt as _, StreamExt as _};
 use tokio::{
     net::TcpStream,
     sync::watch,
     time::{Duration, sleep},
 };
 
-use arti::cfg::ArtiConfig;
 use arti::proxy::ListenProtocols;
-use arti::run_proxy;
-use arti_client::{TorClientConfig, config::TorClientConfigBuilder};
+use arti_client::{
+    BootstrapBehavior, TorClient, TorClientConfig, config::TorClientConfigBuilder,
+    status::BootstrapStatus,
+};
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use tor_config::{ConfigurationSources, Listen, load::Buildable};
-use tor_config_path::CfgPath;
-use tor_rtcompat::{PreferredRuntime, ToplevelBlockOn};
+use parking_lot::{Condvar, Mutex};
+use tor_config::Listen;
+use tor_rtcompat::{NetStreamListener, NetStreamProvider, PreferredRuntime, ToplevelBlockOn};
 use tracing::{debug, error, info, warn};
 
+use crate::BuiltInTorBootstrapStatus;
 use cove_common::consts::ROOT_DATA_DIR;
 
 const BUILT_IN_TOR_SOCKS_PORT: u16 = 39050;
@@ -36,13 +38,13 @@ struct BuiltInTorState {
     launched: bool,
     last_error: Option<String>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    bootstrap_status: BuiltInTorBootstrapStatus,
 }
 
 #[derive(Debug, Clone)]
 struct BuiltInTorPaths {
     state_dir: PathBuf,
     cache_dir: PathBuf,
-    port_info_file: PathBuf,
 }
 
 static BUILT_IN_TOR_STATE: Lazy<Mutex<BuiltInTorState>> = Lazy::new(|| {
@@ -51,20 +53,25 @@ static BUILT_IN_TOR_STATE: Lazy<Mutex<BuiltInTorState>> = Lazy::new(|| {
         launched: false,
         last_error: None,
         shutdown_tx: None,
+        bootstrap_status: default_bootstrap_status(false, None),
     })
 });
+static BUILT_IN_TOR_STOPPED: Lazy<Condvar> = Lazy::new(Condvar::new);
 
 fn clear_built_in_state(reason: &str) {
     let mut state = BUILT_IN_TOR_STATE.lock();
     state.endpoint = None;
     state.launched = false;
     state.shutdown_tx = None;
+    state.bootstrap_status = default_bootstrap_status(false, state.last_error.clone());
     warn!(%reason, "cleared built-in tor state");
+    BUILT_IN_TOR_STOPPED.notify_all();
 }
 
 fn set_built_in_error(error: String) {
     let mut state = BUILT_IN_TOR_STATE.lock();
     state.last_error = Some(error.clone());
+    state.bootstrap_status = default_bootstrap_status(state.launched, Some(error.clone()));
     warn!(%error, "recorded built-in tor runtime error");
 }
 
@@ -82,6 +89,46 @@ pub(crate) fn built_in_status_summary() -> String {
     format!("endpoint={endpoint}, launched={}, last_error={last_error}", state.launched)
 }
 
+pub(crate) fn built_in_bootstrap_status() -> BuiltInTorBootstrapStatus {
+    let state = BUILT_IN_TOR_STATE.lock();
+    let mut status = state.bootstrap_status.clone();
+    status.launched = state.launched;
+    status.last_error = state.last_error.clone();
+    status
+}
+
+fn default_bootstrap_status(
+    launched: bool,
+    last_error: Option<String>,
+) -> BuiltInTorBootstrapStatus {
+    BuiltInTorBootstrapStatus {
+        percent: if launched { 1 } else { 0 },
+        ready: false,
+        blocked: last_error.clone(),
+        message: if launched {
+            "Starting Tor".to_string()
+        } else {
+            "Built-in Tor is not running".to_string()
+        },
+        launched,
+        last_error,
+    }
+}
+
+fn set_bootstrap_status(status: &BootstrapStatus) {
+    let percent = (status.as_frac() * 100.0).round().clamp(0.0, 100.0) as u32;
+    let blocked = status.blocked().map(|blockage| blockage.to_string());
+    let mut state = BUILT_IN_TOR_STATE.lock();
+    state.bootstrap_status = BuiltInTorBootstrapStatus {
+        percent,
+        ready: status.ready_for_traffic(),
+        blocked,
+        message: status.to_string(),
+        launched: state.launched,
+        last_error: state.last_error.clone(),
+    };
+}
+
 pub(crate) fn request_stop_built_in_proxy() -> bool {
     let shutdown_tx = {
         let state = BUILT_IN_TOR_STATE.lock();
@@ -92,25 +139,44 @@ pub(crate) fn request_stop_built_in_proxy() -> bool {
         Some(tx) => {
             if tx.send(true).is_err() {
                 warn!("failed to request built-in tor shutdown: runtime channel closed");
-                return false;
+                return wait_for_built_in_proxy_stopped();
             }
             info!("requested built-in tor shutdown");
-            true
+            wait_for_built_in_proxy_stopped()
         }
         None => {
             debug!("built-in tor shutdown requested but runtime is not active");
-            false
+            true
+        }
+    }
+}
+
+fn wait_for_built_in_proxy_stopped() -> bool {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let started_at = std::time::Instant::now();
+    let mut state = BUILT_IN_TOR_STATE.lock();
+    loop {
+        if !state.launched && state.endpoint.is_none() {
+            info!("built-in tor proxy stopped");
+            return true;
+        }
+
+        let Some(remaining) = STOP_TIMEOUT.checked_sub(started_at.elapsed()) else {
+            warn!("timed out waiting for built-in tor proxy to stop");
+            return false;
+        };
+
+        if BUILT_IN_TOR_STOPPED.wait_for(&mut state, remaining).timed_out() {
+            warn!("timed out waiting for built-in tor proxy to stop");
+            return false;
         }
     }
 }
 
 fn built_in_tor_paths() -> BuiltInTorPaths {
     let tor_root = ROOT_DATA_DIR.join("tor");
-    BuiltInTorPaths {
-        state_dir: tor_root.join("state"),
-        cache_dir: tor_root.join("cache"),
-        port_info_file: tor_root.join("public").join("port_info.json"),
-    }
+    BuiltInTorPaths { state_dir: tor_root.join("state"), cache_dir: tor_root.join("cache") }
 }
 
 fn ensure_built_in_tor_dirs(paths: &BuiltInTorPaths) -> Result<(), Error> {
@@ -128,51 +194,6 @@ fn ensure_built_in_tor_dirs(paths: &BuiltInTorPaths) -> Result<(), Error> {
         ))
     })?;
 
-    if let Some(parent_dir) = paths.port_info_file.parent() {
-        std::fs::create_dir_all(parent_dir).map_err(|error| {
-            Error::Proxy(format!(
-                "failed to create built-in tor port-info dir {}: {error}",
-                parent_dir.display()
-            ))
-        })?;
-    }
-
-    Ok(())
-}
-
-fn configure_built_in_tor_environment(paths: &BuiltInTorPaths) -> Result<(), Error> {
-    let tor_root =
-        paths.state_dir.parent().map(PathBuf::from).unwrap_or_else(|| ROOT_DATA_DIR.join("tor"));
-    let xdg_root = tor_root.join("xdg");
-    let xdg_cache_home = xdg_root.join("cache");
-    let xdg_data_home = xdg_root.join("data");
-    let xdg_state_home = xdg_root.join("state");
-
-    for dir in [&xdg_cache_home, &xdg_data_home, &xdg_state_home] {
-        std::fs::create_dir_all(dir).map_err(|error| {
-            Error::Proxy(format!(
-                "failed to create built-in tor environment dir {}: {error}",
-                dir.display()
-            ))
-        })?;
-    }
-
-    let set_env_if_missing = |key: &str, value: &PathBuf| {
-        if std::env::var_os(key).is_none() {
-            // SAFETY: we only set process environment entries during single-threaded startup
-            // of the built-in Tor runtime, before handing control to Arti internals.
-            unsafe { std::env::set_var(key, value) };
-            info!(env = key, value = %value.display(), "configured built-in tor environment path");
-        }
-    };
-
-    set_env_if_missing("HOME", &ROOT_DATA_DIR);
-    set_env_if_missing("XDG_CACHE_HOME", &xdg_cache_home);
-    set_env_if_missing("XDG_DATA_HOME", &xdg_data_home);
-    set_env_if_missing("XDG_STATE_HOME", &xdg_state_home);
-    set_env_if_missing("ARTI_CACHE", &paths.cache_dir);
-    set_env_if_missing("ARTI_LOCAL_DATA", &tor_root);
-
     Ok(())
 }
 
@@ -183,15 +204,12 @@ fn build_tor_client_config() -> Result<TorClientConfig, Error> {
     info!(
         state_dir = %paths.state_dir.display(),
         cache_dir = %paths.cache_dir.display(),
-        port_info_file = %paths.port_info_file.display(),
         "configuring built-in tor storage directories"
     );
 
-    // Keep storage locations aligned with Arti's env-expanded defaults. This avoids
-    // spurious "Cannot change storage.* on a running client" warnings during reloads.
-    TorClientConfigBuilder::default().build().map_err(|error| {
-        Error::Proxy(format!("failed to build built-in tor client config: {error}"))
-    })
+    TorClientConfigBuilder::from_directories(&paths.state_dir, &paths.cache_dir).build().map_err(
+        |error| Error::Proxy(format!("failed to build built-in tor client config: {error}")),
+    )
 }
 
 async fn wait_for_socks_listener(endpoint: SocketAddr) -> Result<(), Error> {
@@ -254,40 +272,39 @@ async fn launch_built_in_proxy() -> Result<SocketAddr, Error> {
         "resolved built-in tor endpoint"
     );
 
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-
     {
-        let mut state = BUILT_IN_TOR_STATE.lock();
+        let state = BUILT_IN_TOR_STATE.lock();
         if let Some(endpoint) = state.endpoint {
             return Ok(endpoint);
         }
 
         if state.launched {
-            warn!(%endpoint, "built-in tor marked launched but endpoint was missing; reusing configured endpoint");
-            state.endpoint = Some(endpoint);
+            return Err(Error::Proxy(
+                "built-in tor launch already in progress without a ready endpoint".to_string(),
+            ));
+        }
+    }
+
+    let client_config = build_tor_client_config()?;
+    let socks_listen = Listen::new_localhost(BUILT_IN_TOR_SOCKS_PORT);
+
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    {
+        let mut state = BUILT_IN_TOR_STATE.lock();
+        if let Some(endpoint) = state.endpoint {
             return Ok(endpoint);
         }
-
+        if state.launched {
+            return Err(Error::Proxy(
+                "built-in tor launch already in progress without a ready endpoint".to_string(),
+            ));
+        }
         state.launched = true;
         state.endpoint = Some(endpoint);
         state.last_error = None;
         state.shutdown_tx = Some(shutdown_tx);
+        state.bootstrap_status = default_bootstrap_status(true, None);
     }
-
-    let paths = built_in_tor_paths();
-    ensure_built_in_tor_dirs(&paths)?;
-    configure_built_in_tor_environment(&paths)?;
-
-    let mut arti_builder = ArtiConfig::builder();
-    arti_builder.proxy().socks_listen(Listen::new_localhost(BUILT_IN_TOR_SOCKS_PORT));
-    arti_builder.storage().port_info_file(CfgPath::new_literal(&paths.port_info_file));
-    arti_builder.application().watch_configuration(false);
-    info!(%endpoint, "configuring Arti built-in SOCKS listener");
-
-    let arti_config = arti_builder.build().map_err(|error| Error::Proxy(error.to_string()))?;
-
-    let client_config = build_tor_client_config()?;
-    let socks_listen = Listen::new_localhost(BUILT_IN_TOR_SOCKS_PORT);
 
     std::thread::spawn(move || {
         info!("starting built-in tor runtime thread");
@@ -306,20 +323,67 @@ async fn launch_built_in_proxy() -> Result<SocketAddr, Error> {
             }
         };
 
-        info!("launching Arti SOCKS proxy task");
-        let run = run_proxy(
-            proxy_runtime.clone(),
-            socks_listen,
-            Listen::new_none(),
-            ListenProtocols::SocksOnly,
-            ConfigurationSources::new_empty(),
-            arti_config,
-            client_config,
-        );
-
         let run_result = proxy_runtime.block_on(async {
+            info!("creating built-in Tor client");
+            let client = TorClient::with_runtime(proxy_runtime.clone())
+                .config(client_config)
+                .bootstrap_behavior(BootstrapBehavior::OnDemand)
+                .create_unbootstrapped_async()
+                .await
+                .map_err(|error| format!("failed to create built-in tor client: {error}"))?;
+            set_bootstrap_status(&client.bootstrap_status());
+
+            info!("launching Arti SOCKS proxy task");
+            let mut listeners = Vec::new();
+            for addrs in socks_listen
+                .ip_addrs()
+                .map_err(|error| format!("invalid built-in tor socks listener: {error}"))?
+            {
+                for addr in addrs {
+                    let listener = proxy_runtime
+                        .listen(&addr)
+                        .await
+                        .map_err(|error| format!("failed to listen on built-in tor socks address {addr}: {error}"))?;
+                    info!(address = ?listener.local_addr(), "Listening on built-in Tor SOCKS address");
+                    listeners.push(listener);
+                }
+            }
+            if listeners.is_empty() {
+                return Err("failed to open built-in tor socks listener".to_string());
+            }
+
+            let proxy = arti::proxy::run_proxy_with_listeners(
+                client.isolated_client(),
+                listeners,
+                ListenProtocols::SocksOnly,
+                None,
+            )
+            .map(|result| result.map_err(|error| format!("built-in tor socks proxy exited: {error}")));
+
+            let mut bootstrap_events = client.bootstrap_events();
+            let status_watcher = async move {
+                while let Some(status) = bootstrap_events.next().await {
+                    set_bootstrap_status(&status);
+                }
+                futures::future::pending::<Result<(), String>>().await
+            };
+
+            let bootstrap_client = client.clone();
+            let bootstrap = async move {
+                bootstrap_client
+                    .bootstrap()
+                    .await
+                    .map_err(|error| format!("built-in tor bootstrap failed: {error}"))?;
+                let status = bootstrap_client.bootstrap_status();
+                set_bootstrap_status(&status);
+                info!("Sufficiently bootstrapped; proxy now functional.");
+                futures::future::pending::<Result<(), String>>().await
+            };
+
             tokio::select! {
-                run_result = run => run_result,
+                run_result = proxy => run_result,
+                run_result = bootstrap => run_result,
+                run_result = status_watcher => run_result,
                 changed = shutdown_rx.changed() => {
                     match changed {
                         Ok(()) => {

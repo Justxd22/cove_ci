@@ -81,19 +81,19 @@ impl ElectrumClient {
             {
                 Ok(client) => break client,
                 Err(error) => {
-                    if Self::is_built_in_tor_bootstrap_socks_failure(&error) {
-                        if let Some(delay_ms) = retry_delays.get(attempt).copied() {
-                            warn!(
-                                node_url = %url,
-                                attempt = attempt + 1,
-                                max_retries = retry_delays.len(),
-                                delay_ms,
-                                "electrum connect failed while built-in tor may still be bootstrapping; retrying"
-                            );
-                            attempt += 1;
-                            sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            continue;
-                        }
+                    if Self::is_built_in_tor_bootstrap_socks_failure(&error)
+                        && let Some(delay_ms) = retry_delays.get(attempt).copied()
+                    {
+                        warn!(
+                            node_url = %url,
+                            attempt = attempt + 1,
+                            max_retries = retry_delays.len(),
+                            delay_ms,
+                            "electrum connect failed while built-in tor may still be bootstrapping; retrying"
+                        );
+                        attempt += 1;
+                        sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
                     }
 
                     let built_in_tor_status =

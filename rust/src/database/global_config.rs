@@ -96,6 +96,9 @@ pub enum GlobalConfigTableError {
 
     #[error("pin code must be hashed before saving")]
     PinCodeMustBeHashed,
+
+    #[error("failed to stop built-in tor proxy before publishing config update: {0}")]
+    BuiltInTorStop(String),
 }
 
 impl GlobalConfigTable {
@@ -372,8 +375,11 @@ impl GlobalConfigTable {
 
         write_txn.commit().map_err(|error| Error::DatabaseAccess(error.to_string()))?;
 
-        if should_stop_built_in_tor {
-            crate::tor_runtime::request_stop_built_in_proxy();
+        if should_stop_built_in_tor && !crate::tor_runtime::request_stop_built_in_proxy() {
+            return Err(GlobalConfigTableError::BuiltInTorStop(
+                "timed out waiting for proxy shutdown".to_string(),
+            )
+            .into());
         }
 
         Updater::send_update(Update::DatabaseUpdated);

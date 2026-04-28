@@ -92,10 +92,12 @@ import org.bitcoinppl.cove_core.WalletErrorAlert
 import org.bitcoinppl.cove_core.WalletManagerAction
 import org.bitcoinppl.cove_core.WalletSettingsRoute
 import org.bitcoinppl.cove_core.WalletType
+import org.bitcoinppl.cove_core.builtInTorBootstrapStatus
 import org.bitcoinppl.cove_core.ensureBuiltInTorBootstrap
 import org.bitcoinppl.cove_core.torConnectionLogs
 import org.bitcoinppl.cove_core.types.WalletId
 import org.bitcoinppl.cove.tor.deriveBuiltInBootstrapSnapshot
+import org.bitcoinppl.cove.tor.parseCoreTorMode
 import org.bitcoinppl.cove.tor.testSocksEndpoint
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -125,6 +127,35 @@ private fun TorStatusDot.color(): Color =
         TorStatusDot.Red -> Color(0xFFFF3B30)
         TorStatusDot.Gray -> Color(0xFF9E9E9E)
     }
+
+private fun recentTorQuickLogs(logs: List<String>): List<String> {
+    val usefulMarkers =
+        listOf(
+            "arti_client::status",
+            "tor_dirmgr",
+            "tor_guardmgr",
+            "tor_runtime",
+            "bootstrapped",
+            "bootstrap",
+            "directory",
+            "consensus",
+            "microdescriptors",
+            "failed",
+            "error",
+            "warn",
+        )
+
+    return logs
+        .asSequence()
+        .filter { line ->
+            usefulMarkers.any { marker -> line.contains(marker, ignoreCase = true) }
+        }.map { line ->
+            line.replace(Regex("""^\[(INFO|WARN|ERROR|DEBUG) [^\]]+]\s*"""), "")
+        }.filter { line -> line.isNotBlank() }
+        .distinct()
+        .toList()
+        .takeLast(6)
+}
 
 private fun parseEndpointHostPort(endpoint: String): Pair<String, Int>? {
     val host = endpoint.substringBefore(':', "")
@@ -273,10 +304,10 @@ fun SelectedWalletScreen(
 
             val useTor = runCatching { globalConfig.useTor() }.getOrDefault(false)
             val modeName = runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull()
-            val torMode = runCatching { TorMode.valueOf(modeName ?: TorMode.BUILT_IN.name) }
-                .getOrDefault(TorMode.BUILT_IN)
+            val torMode = parseCoreTorMode(modeName)
             val torLogs = runCatching { torConnectionLogs() }.getOrDefault(emptyList())
             val bootstrap = deriveBuiltInBootstrapSnapshot(torLogs)
+            val builtInStatus = runCatching { builtInTorBootstrapStatus() }.getOrNull()
 
             val torConnection: TorStatusDot
             val torMessage: String
@@ -295,27 +326,50 @@ fun SelectedWalletScreen(
                             parseEndpointHostPort(builtInEndpoint)
                                 ?: ("127.0.0.1" to 39050)
                         val socksReady = testSocksEndpoint(builtInHost, builtInPort, 1200).isSuccess
+                        val hasStructuredStatus = builtInStatus?.launched == true
+                        val bootstrapReady = builtInStatus?.ready ?: bootstrap.isReady
+                        val bootstrapError =
+                            builtInStatus?.lastError ?: if (!hasStructuredStatus && bootstrap.hasError) bootstrap.step else null
+                        val bootstrapPercent =
+                            maxOf(
+                                builtInStatus
+                                    ?.takeIf { hasStructuredStatus }
+                                    ?.percent
+                                    ?.toInt()
+                                    ?.coerceIn(0, 100)
+                                    ?: 0,
+                                bootstrap.percent,
+                            )
+                        val bootstrapMessage =
+                            bootstrapError
+                                ?: builtInStatus
+                                    ?.blocked
+                                    ?.let { "Blocked: $it" }
+                                ?: builtInStatus
+                                    ?.message
+                                    ?.takeIf { hasStructuredStatus && it.isNotBlank() }
+                                ?: bootstrap.step
                         torConnection =
                             when {
-                                bootstrap.isReady && socksReady -> TorStatusDot.Green
-                                bootstrap.hasError -> TorStatusDot.Red
+                                bootstrapReady && socksReady -> TorStatusDot.Green
+                                bootstrapError != null -> TorStatusDot.Red
                                 else -> TorStatusDot.Yellow
                             }
                         torMessage =
                             when (torConnection) {
                                 TorStatusDot.Green -> "Built-in Tor ready"
-                                TorStatusDot.Red -> "Built-in Tor error"
-                                else -> "Built-in Tor bootstrapping (${bootstrap.percent}%)"
+                                TorStatusDot.Red -> "Built-in Tor error: $bootstrapMessage"
+                                else -> "Built-in Tor bootstrapping ($bootstrapPercent%)"
                             }
                     }
                     TorMode.ORBOT -> {
                         val socksReady = testSocksEndpoint("127.0.0.1", 9050, 1200).isSuccess
-                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Yellow
+                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Red
                         torMessage =
                             if (socksReady) {
                                 "Orbot SOCKS endpoint reachable"
                             } else {
-                                "Waiting for Orbot SOCKS endpoint"
+                                "Orbot SOCKS endpoint unavailable"
                             }
                     }
                     TorMode.EXTERNAL -> {
@@ -328,12 +382,12 @@ fun SelectedWalletScreen(
                             runCatching { globalConfig.torExternalPort().toInt() }
                                 .getOrDefault(9050)
                         val socksReady = testSocksEndpoint(host, port, 1200).isSuccess
-                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Yellow
+                        torConnection = if (socksReady) TorStatusDot.Green else TorStatusDot.Red
                         torMessage =
                             if (socksReady) {
                                 "External SOCKS endpoint reachable"
                             } else {
-                                "Waiting for external SOCKS endpoint"
+                                "External SOCKS endpoint unavailable"
                             }
                     }
                 }
@@ -392,7 +446,7 @@ fun SelectedWalletScreen(
                     torMessage = torMessage,
                     nodeMessage = nodeMessage,
                     syncMessage = syncMessage,
-                    logs = torLogs.takeLast(6),
+                    logs = recentTorQuickLogs(torLogs),
                 )
 
             delay(2500)

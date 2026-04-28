@@ -60,6 +60,7 @@ import org.bitcoinppl.cove.views.SectionHeader
 import org.bitcoinppl.cove_core.ApiType
 import org.bitcoinppl.cove_core.Database
 import org.bitcoinppl.cove_core.GlobalFlagKey
+import org.bitcoinppl.cove_core.Node
 import org.bitcoinppl.cove_core.NodeSelection
 import org.bitcoinppl.cove_core.NodeSelector
 import org.bitcoinppl.cove_core.NodeSelectorException
@@ -80,7 +81,7 @@ fun NodeSettingsScreen(
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val nodeList = remember { nodeSelector.nodeList() }
+    var nodeList by remember { mutableStateOf(nodeSelector.nodeList()) }
     var selectedNodeSelection by remember { mutableStateOf(nodeSelector.selectedNode()) }
     var selectedNodeName by remember {
         mutableStateOf(selectedNodeSelection.toNode().name)
@@ -94,6 +95,15 @@ fun NodeSettingsScreen(
     var showErrorDialog by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
     var errorTitle by remember { mutableStateOf("") }
+
+    fun refreshNodeSelection(node: Node) {
+        nodeList = NodeSelector().nodeList()
+        selectedNodeSelection = NodeSelection.Custom(node)
+        selectedNodeName = node.name
+        suppressCustomDraftActions = true
+        customUrl = ""
+        customNodeName = ""
+    }
 
     // compute all string resources at composable level
     val customElectrum = stringResource(R.string.node_custom_electrum)
@@ -121,7 +131,7 @@ fun NodeSettingsScreen(
             customUrl = app.pendingNodeUrl
             customNodeName = app.pendingNodeName
             selectedNodeName = app.pendingNodeTypeName
-            Log.d(logTag, "restored pending onion draft: type=$selectedNodeName, url=$customUrl")
+            Log.d(logTag, "restored pending onion draft: type=$selectedNodeName, ${redactedEndpointForLog(customUrl)}")
 
             if (globalConfig.useTor() && app.pendingNodeTorValidated) {
                 isLoading = true
@@ -140,22 +150,13 @@ fun NodeSettingsScreen(
                         nodeSelector.checkAndSaveNode(node)
                     }
 
-                    selectedNodeSelection = NodeSelection.Custom(node)
-                    selectedNodeName =
-                        when (node.apiType) {
-                            ApiType.ELECTRUM -> customElectrum
-                            ApiType.ESPLORA -> customEsplora
-                            else -> node.name
-                        }
+                    refreshNodeSelection(node)
 
                     app.pendingNodeAwaitingTorSetup = false
                     app.pendingNodeTorValidated = false
                     app.pendingNodeUrl = ""
                     app.pendingNodeName = ""
                     app.pendingNodeTypeName = ""
-                    suppressCustomDraftActions = true
-                    customUrl = ""
-                    customNodeName = ""
 
                     scope.launch {
                         snackbarHostState.showSnackbar(successSaved)
@@ -211,14 +212,14 @@ fun NodeSettingsScreen(
                 val node =
                     withContext(Dispatchers.IO) {
                         val selected = nodeSelector.selectPresetNode(nodeName)
-                        Log.d(logTag, "selectPresetNode resolved: name=${selected.name}, apiType=${selected.apiType}, url=${selected.url}")
+                        Log.d(logTag, "selectPresetNode resolved: ${redactedNodeForLog(selected)}")
                         selected
                     }
 
                 withContext(Dispatchers.IO) {
-                    Log.d(logTag, "checkSelectedNode start: name=${node.name}, apiType=${node.apiType}, url=${node.url}")
+                    Log.d(logTag, "checkSelectedNode start: ${redactedNodeForLog(node)}")
                     nodeSelector.checkSelectedNode(node)
-                    Log.d(logTag, "checkSelectedNode success: name=${node.name}, url=${node.url}")
+                    Log.d(logTag, "checkSelectedNode success: ${redactedNodeForLog(node)}")
                 }
                 selectedNodeSelection = NodeSelection.Preset(node)
 
@@ -249,8 +250,18 @@ fun NodeSettingsScreen(
         }
     }
 
+    fun selectCustomNodeType(nodeName: String) {
+        Log.d(logTag, "selectCustomNodeType: nodeName=$nodeName")
+        suppressCustomDraftActions = false
+        if (selectedNodeName != nodeName) {
+            customUrl = ""
+            customNodeName = ""
+        }
+        selectedNodeName = nodeName
+    }
+
     fun checkAndSaveCustomNode() {
-        Log.d(logTag, "checkAndSaveCustomNode: selectedNodeName=$selectedNodeName, customUrl=$customUrl, customNodeName=$customNodeName")
+        Log.d(logTag, "checkAndSaveCustomNode: selectedNodeName=$selectedNodeName, ${redactedEndpointForLog(customUrl)}")
         if (customUrl.isEmpty()) {
             Log.e(logTag, "checkAndSaveCustomNode aborted: empty customUrl")
             errorTitle = errorTitleDefault
@@ -280,9 +291,9 @@ fun NodeSettingsScreen(
 
                 val node =
                     withContext(Dispatchers.IO) {
-                        Log.d(logTag, "parseCustomNode start: url=$customUrl, typeName=$customNodeTypeName, enteredName=$customNodeName")
+                        Log.d(logTag, "parseCustomNode start: typeName=$customNodeTypeName, ${redactedEndpointForLog(customUrl)}")
                         val parsed = nodeSelector.parseCustomNode(customUrl, customNodeTypeName, customNodeName)
-                        Log.d(logTag, "parseCustomNode success: parsedName=${parsed.name}, apiType=${parsed.apiType}, parsedUrl=${parsed.url}")
+                        Log.d(logTag, "parseCustomNode success: ${redactedNodeForLog(parsed)}")
                         parsed
                     }
 
@@ -293,32 +304,34 @@ fun NodeSettingsScreen(
                 val isOnionNode = isOnionNodeUrl(node.url)
                 if (isOnionNode) {
                     if (globalConfig.useTor()) {
-                        Log.d(logTag, "onion node detected with Tor already enabled; saving directly: url=${node.url}")
+                        Log.d(logTag, "onion node detected with Tor already enabled; saving directly: ${redactedNodeForLog(node)}")
                         withContext(Dispatchers.IO) {
                             nodeSelector.checkAndSaveNode(node)
                         }
-                        selectedNodeSelection = NodeSelection.Custom(node)
-                        selectedNodeName =
-                            when (node.apiType) {
-                                ApiType.ELECTRUM -> customElectrum
-                                ApiType.ESPLORA -> customEsplora
-                                else -> node.name
-                            }
+                        refreshNodeSelection(node)
                         app.pendingNodeAwaitingTorSetup = false
                         app.pendingNodeTorValidated = false
                         app.pendingNodeUrl = ""
                         app.pendingNodeName = ""
                         app.pendingNodeTypeName = ""
-                        suppressCustomDraftActions = false
                         scope.launch {
                             snackbarHostState.showSnackbar(successSaved)
                         }
                         return@launch
                     }
 
-                    Log.d(logTag, "onion node detected, redirecting to network settings: url=${node.url}")
-                    globalFlag.set(GlobalFlagKey.TOR_SETTINGS_DISCOVERED, true)
-                    globalConfig.setUseTor(true)
+                    Log.d(logTag, "onion node detected, redirecting to network settings: ${redactedNodeForLog(node)}")
+                    runCatching {
+                        globalFlag.set(GlobalFlagKey.TOR_SETTINGS_DISCOVERED, true)
+                        globalConfig.setUseTor(true)
+                    }.onFailure { error ->
+                        Log.e(logTag, "failed to persist Tor setup before onion redirect: ${error.message}", error)
+                        errorTitle = errorTitleDefault
+                        errorMessage = errorUnknown.format(error.message ?: "")
+                        showErrorDialog = true
+                        return@launch
+                    }
+
                     selectedNodeSelection = NodeSelection.Custom(node)
                     selectedNodeName =
                         when (node.apiType) {
@@ -341,35 +354,29 @@ fun NodeSettingsScreen(
                 }
 
                 withContext(Dispatchers.IO) {
-                    Log.d(logTag, "checkAndSaveNode start: name=${node.name}, apiType=${node.apiType}, url=${node.url}")
+                    Log.d(logTag, "checkAndSaveNode start: ${redactedNodeForLog(node)}")
                     nodeSelector.checkAndSaveNode(node)
-                    Log.d(logTag, "checkAndSaveNode success: name=${node.name}, apiType=${node.apiType}, url=${node.url}")
+                    Log.d(logTag, "checkAndSaveNode success: ${redactedNodeForLog(node)}")
                 }
-                selectedNodeSelection = NodeSelection.Custom(node)
-                selectedNodeName =
-                    when (node.apiType) {
-                        ApiType.ELECTRUM -> customElectrum
-                        ApiType.ESPLORA -> customEsplora
-                        else -> node.name
-                    }
-                Log.d(logTag, "custom node saved: selectedNodeName=$selectedNodeName, persistedName=${node.name}, apiType=${node.apiType}, url=${node.url}")
+                refreshNodeSelection(node)
+                Log.d(logTag, "custom node saved: selectedNodeName=$selectedNodeName, ${redactedNodeForLog(node)}")
 
                 // launch snackbar in separate coroutine so it doesn't block finally
                 scope.launch {
                     snackbarHostState.showSnackbar(successSaved)
                 }
             } catch (e: NodeSelectorException.ParseNodeUrlException) {
-                Log.e(logTag, "checkAndSaveCustomNode failed: ParseNodeUrl url=$customUrl, selectedNodeName=$selectedNodeName, reason=${e.v1}", e)
+                Log.e(logTag, "checkAndSaveCustomNode failed: ParseNodeUrl ${redactedEndpointForLog(customUrl)}, selectedNodeName=$selectedNodeName, reason=${e.v1}", e)
                 errorTitle = errorParseTitle
                 errorMessage = e.v1
                 showErrorDialog = true
             } catch (e: NodeSelectorException.NodeAccessException) {
-                Log.e(logTag, "checkAndSaveCustomNode failed: NodeAccess url=$customUrl, selectedNodeName=$selectedNodeName, reason=${e.v1}", e)
+                Log.e(logTag, "checkAndSaveCustomNode failed: NodeAccess ${redactedEndpointForLog(customUrl)}, selectedNodeName=$selectedNodeName, reason=${e.v1}", e)
                 errorTitle = errorConnectionFailed
                 errorMessage = errorConnectionMessage.format(e.v1)
                 showErrorDialog = true
             } catch (e: Exception) {
-                Log.e(logTag, "checkAndSaveCustomNode failed: unexpected url=$customUrl, selectedNodeName=$selectedNodeName, reason=${e.message}", e)
+                Log.e(logTag, "checkAndSaveCustomNode failed: unexpected ${redactedEndpointForLog(customUrl)}, selectedNodeName=$selectedNodeName, reason=${e.message}", e)
                 errorTitle = errorTitleDefault
                 errorMessage = errorUnknown.format(e.message ?: "")
                 showErrorDialog = true
@@ -452,10 +459,7 @@ fun NodeSettingsScreen(
                         NodeRow(
                             nodeName = customElectrum,
                             isSelected = selectedNodeName == customElectrum,
-                            onClick = {
-                                suppressCustomDraftActions = false
-                                selectedNodeName = customElectrum
-                            },
+                            onClick = { selectCustomNodeType(customElectrum) },
                         )
 
                         MaterialDivider()
@@ -464,10 +468,7 @@ fun NodeSettingsScreen(
                         NodeRow(
                             nodeName = customEsplora,
                             isSelected = selectedNodeName == customEsplora,
-                            onClick = {
-                                suppressCustomDraftActions = false
-                                selectedNodeName = customEsplora
-                            },
+                            onClick = { selectCustomNodeType(customEsplora) },
                         )
                     }
                 }

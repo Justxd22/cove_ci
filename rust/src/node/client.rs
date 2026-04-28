@@ -18,6 +18,7 @@ use bdk_wallet::{
     },
 };
 use bitcoin::{Transaction, Txid};
+use cove_util::ResultExt as _;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -143,17 +144,12 @@ impl NodeClientOptions {
             }
             TorMode::BuiltIn => {
                 info!("tor mode is built-in; requesting Arti socks endpoint");
-                match tor_runtime::built_in_socks_endpoint().await {
-                    Ok(endpoint) => {
-                        self.tor_external_host = endpoint.ip().to_string();
-                        self.tor_external_port = endpoint.port();
-                        info!(%endpoint, "resolved built-in tor socks endpoint");
-                    }
-                    Err(error) => {
-                        tracing::error!("failed to initialize built-in tor runtime: {error}");
-                        return Err(Error::ResolveTorEndpoint(error.to_string()));
-                    }
-                }
+                let endpoint = tor_runtime::built_in_socks_endpoint()
+                    .await
+                    .map_err_str(Error::ResolveTorEndpoint)?;
+                self.tor_external_host = endpoint.ip().to_string();
+                self.tor_external_port = endpoint.port();
+                info!(%endpoint, "resolved built-in tor socks endpoint");
             }
         }
 
@@ -186,7 +182,6 @@ impl NodeClient {
 
         info!(node = %node.url, api_type = ?node.api_type, options = ?options, "creating node client with db-backed options");
 
-        let options = options.resolve_tor_endpoint().await?;
         Self::new_with_options(node, options).await
     }
 

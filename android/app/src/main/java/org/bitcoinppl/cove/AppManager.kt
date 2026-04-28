@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.bitcoinppl.cove.flows.SendFlow.SendFlowManager
 import org.bitcoinppl.cove.flows.SendFlow.SendFlowPresenter
+import org.bitcoinppl.cove.tor.parseCoreTorMode
 import org.bitcoinppl.cove_core.*
 import org.bitcoinppl.cove_core.AppAlertState
 import org.bitcoinppl.cove_core.device.KeychainException
@@ -427,9 +428,9 @@ class AppManager private constructor() : FfiReconcile {
             return
         }
 
-        val mode = globalConfig.get(GlobalConfigKey.TorMode)
-            ?: org.bitcoinppl.cove_core.TorMode.BUILT_IN.name
-        if (mode != org.bitcoinppl.cove_core.TorMode.BUILT_IN.name) {
+        val modeName = runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull()
+        val mode = parseCoreTorMode(modeName)
+        if (mode != TorMode.BUILT_IN) {
             Log.d(tag, "Tor enabled with mode=$mode; no built-in warmup needed")
             return
         }

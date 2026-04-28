@@ -167,7 +167,7 @@ struct NodeSelectionView: View {
 
         guard db.globalConfig().useTor(), app.pendingNodeTorValidated else { return }
 
-        Task {
+        let task = Task {
             showLoadingPopup()
             do {
                 let node = try nodeSelector.parseCustomNode(
@@ -187,6 +187,7 @@ struct NodeSelectionView: View {
                 completeLoading(.failure("Failed to connect to node\n\(error.localizedDescription)"))
             }
         }
+        checkUrlTask = task
     }
 
     private func parseCustomNodeOrShowError() -> Node? {
@@ -217,7 +218,7 @@ struct NodeSelectionView: View {
 
         if isOnionNodeUrl(node.url) {
             if db.globalConfig().useTor() {
-                Task {
+                let task = Task {
                     showLoadingPopup()
                     do {
                         try await nodeSelector.checkAndSaveNode(node: node)
@@ -229,11 +230,19 @@ struct NodeSelectionView: View {
                         completeLoading(.failure("Failed to connect to node\n\(error.localizedDescription)"))
                     }
                 }
+                checkUrlTask = task
                 return
             }
 
-            try? db.globalFlag().set(key: .torSettingsDiscovered, value: true)
-            try? db.globalConfig().setUseTor(useTor: true)
+            do {
+                try db.globalFlag().set(key: .torSettingsDiscovered, value: true)
+                try db.globalConfig().setUseTor(useTor: true)
+            } catch {
+                showParseUrlAlert = true
+                parseUrlMessage = "Failed to enable Tor for this onion node: \(error.localizedDescription)"
+                return
+            }
+
             setCustomSelection(for: node)
             app.pendingNodeUrl = node.url
             app.pendingNodeName = node.name
@@ -244,7 +253,7 @@ struct NodeSelectionView: View {
             return
         }
 
-        Task {
+        let task = Task {
             showLoadingPopup()
             do {
                 try await nodeSelector.checkAndSaveNode(node: node)
@@ -254,6 +263,7 @@ struct NodeSelectionView: View {
                 completeLoading(.failure("Failed to connect to node\n\(error.localizedDescription)"))
             }
         }
+        checkUrlTask = task
     }
 
     private func selectPresetNode(_ nodeSelection: NodeSelection) {
@@ -278,7 +288,7 @@ struct NodeSelectionView: View {
                 try await nodeSelector.checkSelectedNode(node: selected)
                 selectedNodeSelection = .preset(selected)
                 selectedNodeName = selected.name
-                completeLoading(.success("Succesfully connected to \(selected.url)"))
+                completeLoading(.success("Successfully connected to \(selected.url)"))
             } catch {
                 completeLoading(.failure("Failed to connect to \(node.url), reason: \(error.localizedDescription)"))
             }
@@ -306,6 +316,9 @@ struct NodeSelectionView: View {
                         if case let .custom(node) = selectedNodeSelection, node.apiType == .electrum {
                             customUrl = node.url
                             customNodeName = node.name
+                        } else {
+                            customUrl = ""
+                            customNodeName = ""
                         }
                     }
                 )
@@ -319,6 +332,9 @@ struct NodeSelectionView: View {
                         if case let .custom(node) = selectedNodeSelection, node.apiType == .esplora {
                             customUrl = node.url
                             customNodeName = node.name
+                        } else {
+                            customUrl = ""
+                            customNodeName = ""
                         }
                     }
                 )

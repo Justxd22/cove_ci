@@ -4,9 +4,8 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
-use tracing::{Event, Subscriber, field::Visit};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+use tracing::{Event, Level, Subscriber, field::Visit};
+use tracing_subscriber::{EnvFilter, Layer, layer::Context, registry::LookupSpan};
 
 static INIT: Once = Once::new();
 static TOR_LOG_BUFFER: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
@@ -37,6 +36,9 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
+        if !should_capture_tor_event(metadata.level(), metadata.target()) {
+            return;
+        }
 
         let mut visitor = TorEventVisitor::default();
         event.record(&mut visitor);
@@ -57,17 +59,28 @@ where
     }
 }
 
+fn should_capture_tor_event(level: &Level, target: &str) -> bool {
+    match *level {
+        Level::ERROR | Level::WARN | Level::INFO => true,
+        Level::DEBUG => target == "arti_client::status" || target.contains("tor_runtime"),
+        Level::TRACE => false,
+    }
+}
+
 fn is_tor_related(target: &str, line: &str) -> bool {
     if target.starts_with("arti") || target.starts_with("tor_") || target.contains("tor_runtime") {
         return true;
     }
 
     let lowercase = line.to_ascii_lowercase();
-    lowercase.contains(" tor ")
-        || lowercase.contains("tor:")
-        || lowercase.contains("tor-")
+    let has_tor_token = lowercase
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == "tor" || token == "socks5" || token == "socks5h");
+
+    has_tor_token
         || lowercase.contains("onion")
-        || lowercase.contains("socks")
+        || lowercase.contains("tor:")
+        || lowercase.contains("tor=")
 }
 
 fn push_tor_log(line: String) {
@@ -89,12 +102,12 @@ pub fn clear_tor_connection_logs() {
 }
 
 pub fn init() {
+    init_with_default_filter(default_log_filter());
+}
+
+pub fn init_with_default_filter(default_filter: &str) {
     INIT.call_once(|| {
         use tracing_subscriber::{fmt, prelude::*};
-
-        if std::env::var("RUST_LOG").is_err() {
-            unsafe { std::env::set_var("RUST_LOG", "cove=debug,info") }
-        }
 
         #[cfg(target_os = "android")]
         let fmt_layer = fmt::layer().with_writer(std::io::stderr).with_ansi(false);
@@ -102,10 +115,24 @@ pub fn init() {
         #[cfg(not(target_os = "android"))]
         let fmt_layer = fmt::layer().with_writer(std::io::stdout).with_ansi(false);
 
+        let fmt_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
         tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(EnvFilter::from_default_env())
+            .with(fmt_layer.with_filter(fmt_filter))
             .with(TorLogLayer)
             .init();
     });
+}
+
+fn default_log_filter() -> &'static str {
+    #[cfg(debug_assertions)]
+    {
+        "cove=debug,info"
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        "cove=info,info"
+    }
 }

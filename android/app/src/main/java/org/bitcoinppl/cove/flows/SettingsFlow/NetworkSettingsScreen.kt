@@ -90,6 +90,7 @@ import org.bitcoinppl.cove_core.Node
 import org.bitcoinppl.cove_core.NodeSelector
 import org.bitcoinppl.cove_core.NodeSelectorException
 import org.bitcoinppl.cove_core.TorMode as CoreTorMode
+import org.bitcoinppl.cove_core.builtInTorBootstrapStatus
 import org.bitcoinppl.cove_core.ensureBuiltInTorBootstrap
 import org.bitcoinppl.cove_core.torConnectionLogs
 import org.bitcoinppl.cove_core.types.Network
@@ -97,6 +98,7 @@ import org.bitcoinppl.cove_core.types.allNetworks
 import org.bitcoinppl.cove.Log
 import org.bitcoinppl.cove.ui.theme.CoveColor
 import org.bitcoinppl.cove.tor.deriveBuiltInBootstrapSnapshot
+import org.bitcoinppl.cove.tor.parseCoreTorMode
 import org.bitcoinppl.cove.tor.testSocksEndpoint
 import org.bitcoinppl.cove.tor.testTorApiThroughSocks
 import java.net.SocketTimeoutException
@@ -142,18 +144,24 @@ fun NetworkSettingsScreen(
     val nodeSelector = remember { NodeSelector() }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val persistedUseTor = remember { runCatching { globalConfig.useTor() }.getOrDefault(false) }
     val torSettingsDiscovered = remember {
-        globalFlag.getBoolConfig(GlobalFlagKey.TOR_SETTINGS_DISCOVERED)
+        persistedUseTor ||
+            runCatching {
+                globalFlag.getBoolConfig(GlobalFlagKey.TOR_SETTINGS_DISCOVERED)
+            }.getOrDefault(false)
     }
-
-    val persistedUseTor = remember { globalConfig.useTor() }
-    val persistedTorMode = remember { parseTorMode(globalConfig.get(GlobalConfigKey.TorMode)) }
+    val persistedTorMode = remember {
+        parseTorMode(runCatching { globalConfig.get(GlobalConfigKey.TorMode) }.getOrNull())
+    }
     val persistedExternalHost = remember {
-        globalConfig.get(GlobalConfigKey.TorExternalHost)
+        runCatching { globalConfig.get(GlobalConfigKey.TorExternalHost) }.getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?: "127.0.0.1"
     }
-    val persistedExternalPort = remember { globalConfig.torExternalPort().toString() }
+    val persistedExternalPort = remember {
+        runCatching { globalConfig.torExternalPort() }.getOrDefault(9050).toString()
+    }
 
     var uiState by
         remember {
@@ -204,21 +212,57 @@ fun NetworkSettingsScreen(
                         (uiState.logLines + newLogs).takeLast(300)
                     }
                 val snapshot = deriveBuiltInBootstrapSnapshot(rustLogs)
+                val structuredStatus = runCatching { builtInTorBootstrapStatus() }.getOrNull()
+                val hasStructuredStatus = structuredStatus?.launched == true
                 val status =
                     when {
                         !uiState.enabled -> TorStatus.Disabled
+                        structuredStatus?.ready == true -> TorStatus.Ready
+                        structuredStatus?.lastError != null -> TorStatus.Error
+                        hasStructuredStatus -> TorStatus.Bootstrapping
                         snapshot.isReady -> TorStatus.Ready
                         snapshot.hasError -> TorStatus.Error
                         else -> TorStatus.Bootstrapping
                     }
+                val structuredPercent =
+                    structuredStatus
+                        ?.takeIf { hasStructuredStatus }
+                        ?.percent
+                        ?.toInt()
+                        ?.coerceIn(0, 100)
+                val snapshotPercent =
+                    if (structuredPercent == null) {
+                        snapshot.percent
+                    } else {
+                        maxOf(structuredPercent, snapshot.percent)
+                    }
+                val progressPercent =
+                    when {
+                        status == TorStatus.Ready -> 100
+                        status == TorStatus.Bootstrapping && uiState.status == TorStatus.Bootstrapping ->
+                            maxOf(uiState.progressPercent, snapshotPercent)
+                        else -> snapshotPercent
+                    }
+                val currentStep =
+                    (
+                        structuredStatus
+                            ?.lastError
+                            ?: structuredStatus
+                                ?.blocked
+                                ?.let { "Blocked: $it" }
+                            ?: structuredStatus
+                                ?.message
+                                ?.takeIf { hasStructuredStatus && it.isNotBlank() }
+                            ?: snapshot.step
+                    ).replace(Regex("""^\d{1,3}%:\s*"""), "")
 
                 uiState =
                     uiState.copy(
                         status = status,
-                        currentStep = snapshot.step,
+                        currentStep = currentStep,
                         latestLogLine = snapshot.lastLine,
                         logLines = merged,
-                        progressPercent = snapshot.percent,
+                        progressPercent = progressPercent,
                     )
             }.onFailure { error ->
                 Log.e(logTag, "syncRustTorLogs failed: ${error.message}", error)
@@ -235,26 +279,94 @@ fun NetworkSettingsScreen(
     }
 
     fun disableTorState() {
-        globalConfig.setUseTor(false)
+        runCatching {
+            globalConfig.setUseTor(false)
+        }.onFailure { error ->
+            appendTorLog("Failed to disable Tor: ${error.message ?: "unknown error"}")
+            scope.launch {
+                snackbarHostState.showSnackbar("Could not disable Tor: ${error.message ?: "unknown error"}")
+            }
+            return
+        }
+
         uiState = uiState.copy(enabled = false)
         builtInWarmupRequested = false
     }
 
+    fun enableTorState(): Boolean =
+        runCatching {
+            globalConfig.setUseTor(true)
+        }.onFailure { error ->
+            appendTorLog("Failed to enable Tor: ${error.message ?: "unknown error"}")
+            scope.launch {
+                snackbarHostState.showSnackbar("Could not enable Tor: ${error.message ?: "unknown error"}")
+            }
+        }.isSuccess
+
+    fun setPersistedTorMode(
+        mode: TorMode,
+        onFailure: (Throwable) -> Unit = {},
+    ): Boolean {
+        val persistedMode =
+            when (mode) {
+                TorMode.BuiltIn -> CoreTorMode.BUILT_IN.name
+                TorMode.Orbot -> CoreTorMode.ORBOT.name
+                TorMode.External -> CoreTorMode.EXTERNAL.name
+            }
+
+        return runCatching {
+            globalConfig.set(GlobalConfigKey.TorMode, persistedMode)
+        }.onFailure { error ->
+            appendTorLog("Failed to save Tor mode: ${error.message ?: "unknown error"}")
+            scope.launch {
+                snackbarHostState.showSnackbar("Could not save Tor mode: ${error.message ?: "unknown error"}")
+            }
+            onFailure(error)
+        }.isSuccess
+    }
+
+    fun saveExternalTorConfig(
+        host: String,
+        port: UShort,
+        proxyLog: String = redactedProxyForLog(host, port),
+    ): Boolean =
+        runCatching {
+            globalConfig.set(GlobalConfigKey.TorExternalHost, host)
+            globalConfig.setTorExternalPort(port)
+        }.onFailure { error ->
+            appendTorLog("Failed to save external Tor config $proxyLog: ${error.message ?: "unknown error"}")
+            scope.launch {
+                snackbarHostState.showSnackbar("Could not save Tor proxy configuration: ${error.message ?: "unknown error"}")
+            }
+        }.isSuccess
+
+    fun persistTorTestConfiguration(host: String, port: UShort): Boolean {
+        if (!setPersistedTorMode(uiState.mode)) {
+            return false
+        }
+        if (uiState.mode == TorMode.External && !saveExternalTorConfig(host, port)) {
+            return false
+        }
+        return enableTorState()
+    }
+
     suspend fun testTorProxy(host: String, port: UShort): Result<Unit> =
         try {
+            val proxyLog = redactedProxyForLog(host, port)
             syncRustTorLogs()
-            appendTorLog("Testing SOCKS endpoint $host:$port")
-            Log.d(logTag, "testTorProxy start: host=$host, port=$port")
+            appendTorLog("Testing SOCKS endpoint $proxyLog")
+            Log.d(logTag, "testTorProxy start: proxy=$proxyLog")
             testSocksEndpoint(host, port.toInt()).getOrThrow()
-            Log.d(logTag, "testTorProxy success: host=$host, port=$port")
-            appendTorLog("SOCKS endpoint reachable: $host:$port")
+            Log.d(logTag, "testTorProxy success: proxy=$proxyLog")
+            appendTorLog("SOCKS endpoint reachable: $proxyLog")
             syncRustTorLogs()
             Result.success(Unit)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            Log.e(logTag, "testTorProxy failed: host=$host, port=$port, reason=${error.message}", error)
-            appendTorLog("SOCKS endpoint failed: $host:$port (${error.message ?: "unknown error"})")
+            val proxyLog = redactedProxyForLog(host, port)
+            Log.e(logTag, "testTorProxy failed: proxy=$proxyLog, reason=${error.message}", error)
+            appendTorLog("SOCKS endpoint failed: $proxyLog (${error.message ?: "unknown error"})")
             syncRustTorLogs()
             Result.failure(error)
         }
@@ -264,13 +376,13 @@ fun NetworkSettingsScreen(
             withContext(Dispatchers.IO) {
                 if (app.pendingNodeAwaitingTorSetup && app.pendingNodeUrl.isNotBlank()) {
                     val typeName = app.pendingNodeTypeName.ifBlank { "Custom Electrum" }
-                    Log.d(logTag, "resolveNodeForTorTest using pending node: url=${app.pendingNodeUrl}, type=$typeName, name=${app.pendingNodeName}")
+                    Log.d(logTag, "resolveNodeForTorTest using pending node: type=$typeName, ${redactedEndpointForLog(app.pendingNodeUrl)}")
                     val parsed = nodeSelector.parseCustomNode(app.pendingNodeUrl, typeName, app.pendingNodeName)
-                    parsed to "Using pending node for Tor test: ${app.pendingNodeUrl}"
+                    parsed to "Using pending node for Tor test: ${redactedNodeForLog(parsed)}"
                 } else {
                     val selected = app.selectedNode
-                    Log.d(logTag, "resolveNodeForTorTest using selected node: name=${selected.name}, apiType=${selected.apiType}, url=${selected.url}")
-                    selected to "Using selected node for Tor test: ${selected.url}"
+                    Log.d(logTag, "resolveNodeForTorTest using selected node: ${redactedNodeForLog(selected)}")
+                    selected to "Using selected node for Tor test: ${redactedNodeForLog(selected)}"
                 }
             }
 
@@ -281,20 +393,22 @@ fun NetworkSettingsScreen(
     suspend fun runNodeTorTest(node: Node): Result<Unit> =
         try {
             syncRustTorLogs()
-            appendTorLog("Checking node via Tor: ${node.url}")
-            Log.d(logTag, "runNodeTorTest start: name=${node.name}, apiType=${node.apiType}, url=${node.url}")
+            val nodeLog = redactedNodeForLog(node)
+            appendTorLog("Checking node via Tor: $nodeLog")
+            Log.d(logTag, "runNodeTorTest start: $nodeLog")
             withContext(Dispatchers.IO) {
                 nodeSelector.checkSelectedNode(node)
             }
-            Log.d(logTag, "runNodeTorTest success: name=${node.name}, url=${node.url}")
-            appendTorLog("Node check passed: ${node.url}")
+            Log.d(logTag, "runNodeTorTest success: $nodeLog")
+            appendTorLog("Node check passed: $nodeLog")
             syncRustTorLogs()
             Result.success(Unit)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            Log.e(logTag, "runNodeTorTest failed: name=${node.name}, url=${node.url}, reason=${error.message}", error)
-            appendTorLog("Node check failed: ${node.url} (${error.message ?: "unknown error"})")
+            val nodeLog = redactedNodeForLog(node)
+            Log.e(logTag, "runNodeTorTest failed: $nodeLog, reason=${error.message}", error)
+            appendTorLog("Node check failed: $nodeLog (${error.message ?: "unknown error"})")
             syncRustTorLogs()
             Result.failure(error)
         }
@@ -338,7 +452,7 @@ fun NetworkSettingsScreen(
         port: Int,
     ): Result<org.bitcoinppl.cove.tor.TorApiSnapshot> {
         val maxAttempts = 5
-        var timeoutMs = 8000
+        var timeoutMs = 15000
         var lastError: Throwable? = null
 
         repeat(maxAttempts) { index ->
@@ -404,6 +518,13 @@ fun NetworkSettingsScreen(
             }
 
         val (host, port) = endpoint
+        if (!persistTorTestConfiguration(host, port)) {
+            app.pendingNodeTorValidated = false
+            uiState = uiState.copy(status = TorStatus.Error)
+            return
+        }
+
+        val proxyLog = redactedProxyForLog(host, port)
         showTorTestDialog = true
         torTestState =
             TorConnectionTestState(
@@ -414,7 +535,7 @@ fun NetworkSettingsScreen(
                         TorTestStep(
                             key = "proxy",
                             title = "Tor proxy reachable",
-                            detail = "Checking SOCKS endpoint $host:$port",
+                            detail = "Checking SOCKS endpoint $proxyLog",
                         ),
                         TorTestStep(
                             key = "api",
@@ -430,10 +551,8 @@ fun NetworkSettingsScreen(
                 logs = listOf("Starting Tor connection test (${uiState.mode})"),
             )
 
-        globalConfig.setUseTor(true)
         when (uiState.mode) {
             TorMode.BuiltIn -> {
-                globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.BUILT_IN.name)
                 if (!builtInWarmupRequested) {
                     builtInWarmupRequested = true
                     runCatching { ensureBuiltInTorBootstrap() }
@@ -444,12 +563,9 @@ fun NetworkSettingsScreen(
                         }
                 }
             }
-            TorMode.Orbot -> globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.ORBOT.name)
-            TorMode.External -> {
-                globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.EXTERNAL.name)
-                globalConfig.set(GlobalConfigKey.TorExternalHost, host)
-                globalConfig.setTorExternalPort(port)
-            }
+            TorMode.Orbot,
+            TorMode.External,
+            -> Unit
         }
 
         updateTorTestStep("proxy", TorTestStepStatus.Running)
@@ -627,14 +743,22 @@ fun NetworkSettingsScreen(
                         currentStep = if (validationError == null) torActionSaveConfig else torErrorConfigInvalid,
                         latestLogLine =
                             if (validationError == null) {
-                                "${uiState.externalHost}:${uiState.externalPort}"
+                                redactedProxyForLog(
+                                    uiState.externalHost,
+                                    uiState.externalPort.toUShortOrNull() ?: 9050u,
+                                )
                             } else {
                                 validationError
                             },
                     )
                 appendTorLog(
                     if (validationError == null) {
-                        "External Tor selected: ${uiState.externalHost}:${uiState.externalPort}"
+                        "External Tor selected: ${
+                            redactedProxyForLog(
+                                uiState.externalHost,
+                                uiState.externalPort.toUShortOrNull() ?: 9050u,
+                            )
+                        }"
                     } else {
                         "External Tor config invalid: $validationError"
                     },
@@ -803,7 +927,9 @@ fun NetworkSettingsScreen(
                                         return@MaterialSettingsItem
                                     }
 
-                                    globalConfig.setUseTor(true)
+                                    if (!enableTorState()) {
+                                        return@MaterialSettingsItem
+                                    }
                                     uiState = uiState.copy(enabled = true)
                                     if (uiState.mode == TorMode.BuiltIn && !builtInWarmupRequested) {
                                         scope.launch {
@@ -897,13 +1023,6 @@ fun NetworkSettingsScreen(
                                     style = MaterialTheme.typography.bodyMedium,
                                     modifier = Modifier.padding(top = 12.dp),
                                 )
-                                Text(
-                                    text = "${stringResource(R.string.tor_latest_log_prefix)} ${uiState.latestLogLine}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(top = 8.dp),
-                                )
-
                                 Row(
                                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -996,11 +1115,20 @@ fun NetworkSettingsScreen(
                                                 return@Button
                                             }
 
-                                            Log.d(logTag, "save external tor config: host=${uiState.externalHost}, port=${uiState.externalPort}")
-                                            globalConfig.set(GlobalConfigKey.TorExternalHost, uiState.externalHost)
-                                            uiState.externalPort.toUShortOrNull()?.let { globalConfig.setTorExternalPort(it) }
+                                            val proxyLog =
+                                                redactedProxyForLog(
+                                                    uiState.externalHost,
+                                                    uiState.externalPort.toUShortOrNull() ?: 9050u,
+                                                )
+                                            Log.d(logTag, "save external tor config: proxy=$proxyLog")
+                                            val externalPort = uiState.externalPort.toUShortOrNull()
+                                            if (externalPort == null ||
+                                                !saveExternalTorConfig(uiState.externalHost, externalPort, proxyLog)
+                                            ) {
+                                                return@Button
+                                            }
                                             app.pendingNodeTorValidated = false
-                                            appendTorLog("Saved external Tor config: ${uiState.externalHost}:${uiState.externalPort}")
+                                            appendTorLog("Saved external Tor config: $proxyLog")
                                             scope.launch { snackbarHostState.showSnackbar(torSuccessConfigurationSaved) }
                                         },
                                         modifier = Modifier.weight(1f),
@@ -1018,8 +1146,13 @@ fun NetworkSettingsScreen(
                                             }
 
                                             scope.launch {
-                                                appendTorLog("External Tor connection test requested for ${uiState.externalHost}:${uiState.externalPort}")
-                                                Log.d(logTag, "external test connection tapped: host=${uiState.externalHost}, port=${uiState.externalPort}, pendingAwaiting=${app.pendingNodeAwaitingTorSetup}, pendingValidated=${app.pendingNodeTorValidated}")
+                                                val proxyLog =
+                                                    redactedProxyForLog(
+                                                        uiState.externalHost,
+                                                        uiState.externalPort.toUShortOrNull() ?: 9050u,
+                                                    )
+                                                appendTorLog("External Tor connection test requested for $proxyLog")
+                                                Log.d(logTag, "external test connection tapped: proxy=$proxyLog, pendingAwaiting=${app.pendingNodeAwaitingTorSetup}, pendingValidated=${app.pendingNodeTorValidated}")
                                                 runProgressiveTorTest()
                                             }
                                         },
@@ -1137,7 +1270,9 @@ fun NetworkSettingsScreen(
                         selected = uiState.mode == TorMode.BuiltIn,
                         onClick = {
                             Log.d(logTag, "set tor mode: BUILT_IN")
-                            globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.BUILT_IN.name)
+                            if (!setPersistedTorMode(TorMode.BuiltIn)) {
+                                return@TorModeOption
+                            }
                             app.pendingNodeTorValidated = false
                             autoPendingTestKey = null
                             uiState = uiState.copy(mode = TorMode.BuiltIn)
@@ -1162,7 +1297,9 @@ fun NetworkSettingsScreen(
                         selected = uiState.mode == TorMode.Orbot,
                         onClick = {
                             Log.d(logTag, "set tor mode: ORBOT")
-                            globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.ORBOT.name)
+                            if (!setPersistedTorMode(TorMode.Orbot)) {
+                                return@TorModeOption
+                            }
                             app.pendingNodeTorValidated = false
                             autoPendingTestKey = null
                             uiState = uiState.copy(mode = TorMode.Orbot)
@@ -1175,7 +1312,9 @@ fun NetworkSettingsScreen(
                         selected = uiState.mode == TorMode.External,
                         onClick = {
                             Log.d(logTag, "set tor mode: EXTERNAL")
-                            globalConfig.set(GlobalConfigKey.TorMode, CoreTorMode.EXTERNAL.name)
+                            if (!setPersistedTorMode(TorMode.External)) {
+                                return@TorModeOption
+                            }
                             app.pendingNodeTorValidated = false
                             autoPendingTestKey = null
                             uiState = uiState.copy(mode = TorMode.External)
@@ -1215,7 +1354,9 @@ fun NetworkSettingsScreen(
                                 }
 
                                 val fallbackNode = fallbackResult.getOrThrow()
-                                appendTorLog("Switched active node to ${fallbackNode.url} before disabling Tor")
+                                appendTorLog(
+                                    "Switched active node to ${redactedNodeForLog(fallbackNode)} before disabling Tor",
+                                )
                                 snackbarHostState.showSnackbar(
                                     torFallbackApplied.format(fallbackNode.name),
                                 )
@@ -1506,10 +1647,10 @@ private fun TorTestStepProgressRow(step: TorTestStep) {
 }
 
 private fun parseTorMode(mode: String?): TorMode {
-    return when (mode) {
-        CoreTorMode.ORBOT.name -> TorMode.Orbot
-        CoreTorMode.EXTERNAL.name -> TorMode.External
-        else -> TorMode.BuiltIn
+    return when (parseCoreTorMode(mode)) {
+        CoreTorMode.ORBOT -> TorMode.Orbot
+        CoreTorMode.EXTERNAL -> TorMode.External
+        CoreTorMode.BUILT_IN -> TorMode.BuiltIn
     }
 }
 

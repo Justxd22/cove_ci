@@ -1,6 +1,8 @@
 use tracing::{error, info, warn};
 use url::Url;
 
+use cove_util::ResultExt as _;
+
 use crate::{
     database::{Database, global_flag::GlobalFlagKey},
     network::Network,
@@ -170,8 +172,7 @@ impl NodeSelector {
             None => hinted_api_type,
         };
 
-        let url = parse_node_url(&url, api_type)
-            .map_err(|error| Error::ParseNodeUrlError(error.to_string()))?;
+        let url = parse_node_url(&url, api_type).map_err_str(Error::ParseNodeUrlError)?;
 
         if !url.domain().unwrap_or_default().contains('.') {
             return Err(Error::ParseNodeUrlError("invalid url, no domain".to_string()));
@@ -204,11 +205,6 @@ impl NodeSelector {
 
         let database = Database::global();
 
-        database
-            .global_config
-            .set_selected_node(&node)
-            .map_err(|error| Error::SetSelectedNodeError(error.to_string()))?;
-
         if node_implies_tor(&node) {
             database
                 .global_flag
@@ -219,6 +215,11 @@ impl NodeSelector {
                 .set_use_tor(true)
                 .map_err(|error| Error::SetSelectedNodeError(error.to_string()))?;
         }
+
+        database
+            .global_config
+            .set_selected_node(&node)
+            .map_err(|error| Error::SetSelectedNodeError(error.to_string()))?;
 
         Ok(())
     }
@@ -289,13 +290,21 @@ async fn check_node_with_tor_inference(node: &Node) -> Result<(), crate::node::E
     let inferred_tor = node_implies_tor(node);
     info!(node = %node.url, api_type = ?node.api_type, inferred_tor, "checking node with tor inference");
 
+    let db = Database::global();
+    let config = db.global_config();
+
     if !inferred_tor {
-        info!(node = %node.url, "node does not imply tor; checking directly");
+        if config.use_tor() {
+            info!(node = %node.url, "node does not imply tor, but global tor is enabled; checking through configured tor client");
+            let client = NodeClient::new(node).await?;
+            client.check_url().await?;
+            return Ok(());
+        }
+
+        info!(node = %node.url, "node does not imply tor and global tor is disabled; checking directly");
         return node.check_url().await;
     }
 
-    let db = Database::global();
-    let config = db.global_config();
     let tor_external_host = config
         .tor_external_host()
         .ok()
@@ -316,9 +325,6 @@ async fn check_node_with_tor_inference(node: &Node) -> Result<(), crate::node::E
     };
 
     info!(node = %node.url, options = ?options, "node implies tor; building tor-enabled node client");
-
-    let options = options.resolve_tor_endpoint().await?;
-    info!(resolved_options = ?options, "resolved tor endpoint for inferred tor node check");
 
     let client = NodeClient::new_with_options(node, options).await?;
     info!(node = %node.url, "running node check through tor-capable client");
