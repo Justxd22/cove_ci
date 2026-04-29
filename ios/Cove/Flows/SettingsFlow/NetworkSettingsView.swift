@@ -564,6 +564,13 @@ struct NetworkSettingsView: View {
         torTestState.logs = Array((torTestState.logs + [message]).suffix(150))
     }
 
+    private func leadingPercent(_ message: String) -> Int? {
+        guard let match = message.range(of: #"^\d{1,3}(?=%:)"#, options: .regularExpression) else {
+            return nil
+        }
+        return Int(message[match]).map { min(max($0, 0), 100) }
+    }
+
     private func syncRustTorLogs() {
         guard uiState.enabled, uiState.mode == .builtIn else { return }
 
@@ -594,21 +601,15 @@ struct NetworkSettingsView: View {
         } else {
             .bootstrapping
         }
-        let snapshotPercent = hasStructuredStatus ? max(Int(structuredStatus.percent), snapshot.percent) : snapshot.percent
-        if nextStatus == .ready {
-            uiState.progressPercent = 100
-        } else if nextStatus == .bootstrapping, uiState.status == .bootstrapping {
-            uiState.progressPercent = max(uiState.progressPercent, snapshotPercent)
-        } else {
-            uiState.progressPercent = snapshotPercent
-        }
-        uiState.currentStep =
-            (
-                structuredStatus.lastError
-                    ?? structuredStatus.blocked.map { "Blocked: \($0)" }
-                    ?? (hasStructuredStatus && !structuredStatus.message.isEmpty ? structuredStatus.message : snapshot.step)
-            )
-            .replacingOccurrences(of: #"^\d{1,3}%:\s*"#, with: "", options: .regularExpression)
+        let currentStep =
+            structuredStatus.lastError
+                ?? structuredStatus.blocked.map { "Blocked: \($0)" }
+                ?? (leadingPercent(snapshot.step) != nil ? snapshot.step : nil)
+                ?? (hasStructuredStatus && !structuredStatus.message.isEmpty ? structuredStatus.message : snapshot.step)
+        let messagePercent = leadingPercent(currentStep)
+        let snapshotPercent = messagePercent ?? (hasStructuredStatus ? Int(structuredStatus.percent) : snapshot.percent)
+        uiState.progressPercent = nextStatus == .ready ? 100 : snapshotPercent
+        uiState.currentStep = currentStep
         uiState.latestLogLine = snapshot.lastLine
         uiState.status = nextStatus
     }

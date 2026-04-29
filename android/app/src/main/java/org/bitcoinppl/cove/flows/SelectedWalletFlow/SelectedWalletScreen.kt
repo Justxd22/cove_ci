@@ -157,6 +157,14 @@ private fun recentTorQuickLogs(logs: List<String>): List<String> {
         .takeLast(6)
 }
 
+private fun leadingPercent(message: String): Int? =
+    Regex("""^(\d{1,3})%:""")
+        .find(message)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+        ?.coerceIn(0, 100)
+
 private fun parseEndpointHostPort(endpoint: String): Pair<String, Int>? {
     val host = endpoint.substringBefore(':', "")
     val port = endpoint.substringAfter(':', "").toIntOrNull()
@@ -330,25 +338,26 @@ fun SelectedWalletScreen(
                         val bootstrapReady = builtInStatus?.ready ?: bootstrap.isReady
                         val bootstrapError =
                             builtInStatus?.lastError ?: if (!hasStructuredStatus && bootstrap.hasError) bootstrap.step else null
-                        val bootstrapPercent =
-                            maxOf(
-                                builtInStatus
-                                    ?.takeIf { hasStructuredStatus }
-                                    ?.percent
-                                    ?.toInt()
-                                    ?.coerceIn(0, 100)
-                                    ?: 0,
-                                bootstrap.percent,
-                            )
                         val bootstrapMessage =
                             bootstrapError
                                 ?: builtInStatus
                                     ?.blocked
                                     ?.let { "Blocked: $it" }
+                                ?: bootstrap
+                                    .step
+                                    .takeIf { leadingPercent(it) != null }
                                 ?: builtInStatus
                                     ?.message
                                     ?.takeIf { hasStructuredStatus && it.isNotBlank() }
                                 ?: bootstrap.step
+                        val bootstrapPercent =
+                            leadingPercent(bootstrapMessage)
+                                ?: builtInStatus
+                                    ?.takeIf { hasStructuredStatus }
+                                    ?.percent
+                                    ?.toInt()
+                                    ?.coerceIn(0, 100)
+                                ?: bootstrap.percent
                         torConnection =
                             when {
                                 bootstrapReady && socksReady -> TorStatusDot.Green

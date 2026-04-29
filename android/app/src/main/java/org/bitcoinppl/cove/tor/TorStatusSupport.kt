@@ -24,6 +24,7 @@ data class TorApiSnapshot(
 )
 
 private val bootstrapPercentRegex = Regex("""\b(100|[0-9]{1,2})%\b""")
+private val artiStatusRegex = Regex("""arti_client::status]\s*(100|[0-9]{1,2})%:\s*(.+)$""")
 private val missingCountRegex = Regex("""missing\s+(\d+)""")
 private val missingFractionRegex = Regex("""missing\s+(\d+)\s*/\s*(\d+)""")
 private val torApiBooleanRegex =
@@ -81,6 +82,17 @@ fun deriveBuiltInBootstrapSnapshot(logLines: List<String>): TorBootstrapSnapshot
 
     scopedLogs.forEach { line ->
         val lowered = line.lowercase()
+        artiStatusRegex.find(line)?.let { match ->
+            val found = match.groupValues[1].toInt().coerceIn(0, 100)
+            val message = match.groupValues[2]
+            percent = found
+            step = "$found%: $message"
+            if (found >= 100) {
+                ready = true
+            }
+            return@forEach
+        }
+
         bootstrapPercentRegex.find(line)?.groupValues?.get(1)?.toIntOrNull()?.let { found ->
             if (found > percent) {
                 percent = found

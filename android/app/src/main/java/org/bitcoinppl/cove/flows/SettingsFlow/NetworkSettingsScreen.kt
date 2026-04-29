@@ -224,37 +224,37 @@ fun NetworkSettingsScreen(
                         snapshot.hasError -> TorStatus.Error
                         else -> TorStatus.Bootstrapping
                     }
+                val currentStep =
+                    structuredStatus
+                        ?.lastError
+                        ?: structuredStatus
+                            ?.blocked
+                            ?.let { "Blocked: $it" }
+                        ?: snapshot
+                            .step
+                            .takeIf { Regex("""^\d{1,3}%:""").containsMatchIn(it) }
+                        ?: structuredStatus
+                            ?.message
+                            ?.takeIf { hasStructuredStatus && it.isNotBlank() }
+                        ?: snapshot.step
+                val messagePercent =
+                    Regex("""^(\d{1,3})%:""")
+                        .find(currentStep)
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        ?.toIntOrNull()
+                        ?.coerceIn(0, 100)
                 val structuredPercent =
                     structuredStatus
                         ?.takeIf { hasStructuredStatus }
                         ?.percent
                         ?.toInt()
                         ?.coerceIn(0, 100)
-                val snapshotPercent =
-                    if (structuredPercent == null) {
-                        snapshot.percent
-                    } else {
-                        maxOf(structuredPercent, snapshot.percent)
-                    }
                 val progressPercent =
                     when {
                         status == TorStatus.Ready -> 100
-                        status == TorStatus.Bootstrapping && uiState.status == TorStatus.Bootstrapping ->
-                            maxOf(uiState.progressPercent, snapshotPercent)
-                        else -> snapshotPercent
+                        else -> messagePercent ?: structuredPercent ?: snapshot.percent
                     }
-                val currentStep =
-                    (
-                        structuredStatus
-                            ?.lastError
-                            ?: structuredStatus
-                                ?.blocked
-                                ?.let { "Blocked: $it" }
-                            ?: structuredStatus
-                                ?.message
-                                ?.takeIf { hasStructuredStatus && it.isNotBlank() }
-                            ?: snapshot.step
-                    ).replace(Regex("""^\d{1,3}%:\s*"""), "")
 
                 uiState =
                     uiState.copy(

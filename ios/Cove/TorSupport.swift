@@ -239,6 +239,22 @@ private func firstRegexInts(_ pattern: String, in string: String) -> [Int]? {
     }
 }
 
+private func artiStatus(_ line: String) -> (percent: Int, message: String)? {
+    let pattern = #"arti_client::status]\s*(100|[0-9]{1,2})%:\s*(.+)$"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+          match.numberOfRanges == 3,
+          let percentRange = Range(match.range(at: 1), in: line),
+          let messageRange = Range(match.range(at: 2), in: line),
+          let percent = Int(line[percentRange])
+    else {
+        return nil
+    }
+
+    return (min(max(percent, 0), 100), String(line[messageRange]))
+}
+
 func deriveBuiltInBootstrapSnapshot(_ logLines: [String]) -> TorBootstrapSnapshot {
     guard !logLines.isEmpty else {
         return TorBootstrapSnapshot(
@@ -280,6 +296,15 @@ func deriveBuiltInBootstrapSnapshot(_ logLines: [String]) -> TorBootstrapSnapsho
 
     for line in scopedLogs {
         let lowered = line.lowercased()
+        if let status = artiStatus(line) {
+            percent = status.percent
+            step = "\(status.percent)%: \(status.message)"
+            if status.percent >= 100 {
+                ready = true
+            }
+            continue
+        }
+
         if let found = firstRegexInt(#"\b(100|[0-9]{1,2})%\b"#, in: line), found > percent {
             percent = found
         }

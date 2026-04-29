@@ -295,12 +295,13 @@ struct SelectedWalletScreen: View {
             quick.torConnection = .red
             quick.torMessage = snapshot.step
         } else {
-            let percent = hasStructuredStatus ? max(Int(structuredStatus.percent), snapshot.percent) : snapshot.percent
             let message =
                 structuredStatus.blocked.map { "Blocked: \($0)" }
+                    ?? (leadingPercent(snapshot.step) != nil ? snapshot.step : nil)
                     ?? (hasStructuredStatus && !structuredStatus.message.isEmpty ? structuredStatus.message : snapshot.step)
+            let percent = leadingPercent(message) ?? (hasStructuredStatus ? Int(structuredStatus.percent) : snapshot.percent)
             quick.torConnection = .yellow
-            quick.torMessage = "\(percent)% \(message.replacingOccurrences(of: #"^\d{1,3}%:\s*"#, with: "", options: .regularExpression))"
+            quick.torMessage = "Built-in Tor bootstrapping (\(percent)%)"
         }
     }
 
@@ -399,6 +400,13 @@ struct SelectedWalletScreen: View {
             .filter { !$0.isEmpty }
 
         return Array(NSOrderedSet(array: usefulLogs).array.compactMap { $0 as? String }.suffix(6))
+    }
+
+    private func leadingPercent(_ message: String) -> Int? {
+        guard let match = message.range(of: #"^\d{1,3}(?=%:)"#, options: .regularExpression) else {
+            return nil
+        }
+        return Int(message[match]).map { min(max($0, 0), 100) }
     }
 
     var titleContent: some View {
